@@ -1,0 +1,18 @@
+[project]
+name = "telegram-uploader"
+version = "0.1.0"
+description = "Telegram Auto Uploader Pro Desktop GUI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptg>=0.6.1",
+    "customtkinter>=6.0.0",
+    "pillow>=13.0.0",
+    "qrcode>=8.2",
+    "telethon>=1.45.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22.3",
+]
