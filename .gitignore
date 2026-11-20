@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.session
+*.session-journal
+.env
+config.json
+sent_history.json
+queue_state.json
