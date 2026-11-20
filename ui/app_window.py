@@ -65,6 +65,10 @@ from ui.widgets import (
     _create_nav_icons,
     draw_telegram_wallpaper_canvas,
     LabeledProgressBar,
+    FILE_TYPE_FILTER_OPTIONS,
+    FILTER_LABEL_TO_CATEGORY,
+    create_file_type_icons,
+    get_file_category,
 )
 
 
@@ -97,7 +101,13 @@ class TelegramUploaderApp(
             pass
 
         self.nav_icons = _create_nav_icons()
+        self.file_type_icons = create_file_type_icons()
         self.worker = AsyncWorker()
+        self._save_io_lock = threading.Lock()
+        self._save_queue_pending = False
+        self._save_history_pending = False
+        self._summary_update_pending = False
+        self.ignore_all_duplicates_session = False
         self._migrate_legacy_local_files_if_same_pc()
         self.config_data = self._load_config()
         self.history_records: List[dict] = self._load_history()
@@ -122,21 +132,25 @@ class TelegramUploaderApp(
             "id": self.config_data.get("user_id", ""),
         }
 
-        # Estruturas da Fila de Upload
+        # Estruturas da Fila de Upload (com Paginação Virtual para suportar 70.000+ arquivos sem travar)
         self.queue: List[FileQueueItem] = []
         self.queue_by_id: Dict[str, FileQueueItem] = {}
         self.queued_paths: Set[Path] = set()
+        self.ul_filtered_items: List[FileQueueItem] = []
+        self.ul_page_size: int = 500
+        self.ul_page_index: int = 0
         self._next_id_counter = 1
         self.queue_filter_mode: str = "Todos"
         self.resume_upload_on_connect: bool = False
 
-        # Estruturas da Aba Download (Drive / Nuvem Telegram + Paginação Virtual para 150.000+ arquivos)
+        # Estruturas da Aba Download (Drive / Nuvem Telegram + Filtro por Tipo + Paginação Virtual)
         self.remote_files: List[RemoteCloudFile] = []
         self.remote_by_id: Dict[str, RemoteCloudFile] = {}
         self.remote_by_filename_lower: Dict[str, RemoteCloudFile] = {}
         self.dl_filtered_files: List[RemoteCloudFile] = []
         self.dl_page_size: int = 500
         self.dl_page_index: int = 0
+        self.dl_type_filter: str = "all"
         self.is_scanning_remote = False
         self._remote_scan_token = 0
         self._dl_filter_render_token = 0
@@ -161,19 +175,35 @@ class TelegramUploaderApp(
         self.page_frames: Dict[str, ctk.CTkFrame] = {}
 
         self._build_ui()
-        self._populate_history_tree()
-        self._load_previous_logs_into_ui()
-        self._restore_saved_queue_state()
+        # Abre IMEDIATAMENTE na aba Upload antes de restaurar filas grandes (evita travar na aba Conta)
         self.switch_page("upload")
 
         self.protocol("WM_DELETE_WINDOW", self._on_app_closing)
         super().after(25, self._drain_ui_dispatch_queue)
-        super().after(300, self._try_auto_connect)
+        super().after(60, self._deferred_startup_restore)
+        super().after(350, self._try_auto_connect)
         if not self.config_data.get("hide_welcome_guide", False):
-            super().after(450, self.show_welcome_guide)
+            super().after(500, self.show_welcome_guide)
         super().after(
-            1800, lambda: self.check_for_updates(silent_if_up_to_date=True)
+            2200, lambda: self.check_for_updates(silent_if_up_to_date=True)
         )
+
+    def _deferred_startup_restore(self):
+        """Carrega histórico (500 mais recentes), logs e fila salva após a janela já estar visível na aba Upload."""
+        self._populate_history_tree()
+        self._load_previous_logs_into_ui()
+        self._restore_saved_queue_state()
+
+    def _has_blocking_modal_open(self) -> bool:
+        """Retorna True se o Guia de Boas-Vindas ou a janela de Atualização estiverem abertos."""
+        for attr in ("welcome_win", "update_win"):
+            win = getattr(self, attr, None)
+            try:
+                if win is not None and win.winfo_exists():
+                    return True
+            except Exception:
+                pass
+        return False
 
     def after(self, ms, func=None, *args):
         """
@@ -331,13 +361,33 @@ class TelegramUploaderApp(
         return []
 
     def _save_history(self):
+        """Grava o histórico em disco em formato compacto (sem travar a UI com indent=2 em 18.000+ itens)."""
+        snapshot = list(self.history_records)
         try:
-            HISTORY_FILE.write_text(
-                json.dumps(self.history_records, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            with self._save_io_lock:
+                HISTORY_FILE.write_text(
+                    json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
         except Exception as e:
-            self.log(f"Aviso ao salvar histórico: {e}")
+            append_persistent_log(f"Aviso ao salvar histórico: {e}", "WARN")
+
+    def _schedule_save_history(self, immediate: bool = False):
+        """Agenda gravação assíncrona do histórico com debounce de 4s para eliminar travamento no 100%."""
+        if immediate:
+            self._save_history_pending = False
+            threading.Thread(target=self._save_history, daemon=True).start()
+            return
+        if self._save_history_pending:
+            return
+        self._save_history_pending = True
+
+        def _flush():
+            time.sleep(4.0)
+            self._save_history_pending = False
+            self._save_history()
+
+        threading.Thread(target=_flush, daemon=True).start()
 
     def _record_sent_file(self, item: FileQueueItem, target_label: str):
         now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -356,7 +406,7 @@ class TelegramUploaderApp(
         item.target_chat = target_label
         self.history_records.insert(0, record)
         self.sent_signatures[sig] = record
-        self._save_history()
+        self._schedule_save_history()
 
         def _ui():
             if hasattr(self, "history_tree") and self.history_tree.winfo_exists():
@@ -372,6 +422,11 @@ class TelegramUploaderApp(
                     ),
                     tags=("Concluído",),
                 )
+                # Mantém no máximo 500 linhas visíveis no Histórico para nunca pesar o Tkinter
+                children = self.history_tree.get_children()
+                if len(children) > 500:
+                    for old_iid in children[500:]:
+                        self.history_tree.delete(old_iid)
                 self._update_history_summary()
 
         self.after(0, _ui)
@@ -523,47 +578,90 @@ class TelegramUploaderApp(
     # -------------------------------------------------------------------------
     # Persistência Automática da Fila de Tarefas e Logs (Auto-Save / Recovery)
     # -------------------------------------------------------------------------
-    def _save_queue_state(self):
-        """Salva no disco a fila de tarefas de upload e se havia tarefa em execução."""
-        try:
-            items_data = []
-            for item in self.queue:
-                items_data.append(
-                    {
-                        "path": str(item.path),
-                        "size": item.size,
-                        "status": item.status,
-                        "progress": item.progress,
-                        "sent_at": item.sent_at,
-                        "target_chat": item.target_chat,
-                        "checked": item.checked,
-                        "sha256": getattr(item, "sha256", "") or "",
-                    }
-                )
-            state = {
-                "saved_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                "was_uploading": bool(self.is_uploading),
-                "target": (
-                    self.target_combo.get()
-                    if hasattr(self, "target_combo")
-                    else self.config_data.get("last_target", "")
-                ),
-                "items": items_data,
+    def _build_queue_state_dict(self) -> dict:
+        items_snapshot = list(self.queue)
+        items_data = [
+            {
+                "path": str(item.path),
+                "size": item.size,
+                "status": item.status,
+                "progress": item.progress,
+                "sent_at": item.sent_at,
+                "target_chat": item.target_chat,
+                "checked": item.checked,
+                "sha256": getattr(item, "sha256", "") or "",
             }
-            QUEUE_STATE_FILE.write_text(
-                json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
+            for item in items_snapshot
+        ]
+        target_str = self.config_data.get("last_target", "")
+        if threading.get_ident() == self._main_thread_id and hasattr(self, "target_combo"):
+            try:
+                target_str = self.target_combo.get()
+            except Exception:
+                pass
+        return {
+            "saved_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "was_uploading": bool(self.is_uploading),
+            "ignore_all_duplicates": bool(
+                getattr(self, "ignore_all_duplicates_session", False)
+            ),
+            "target": target_str,
+            "items": items_data,
+        }
+
+    def _save_queue_state(self):
+        """Salva no disco a fila de tarefas de upload em formato compacto (sem indent=2)."""
+        try:
+            state = self._build_queue_state_dict()
+            raw = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+            with self._save_io_lock:
+                QUEUE_STATE_FILE.write_text(raw, encoding="utf-8")
         except Exception as e:
             append_persistent_log(f"Aviso ao salvar estado da fila: {e}", "WARN")
 
+    def _schedule_save_queue_state(self, immediate: bool = False):
+        """
+        Agenda gravação assíncrona da fila em background (debounce de 4s).
+        Elimina 100% do congelamento da janela do Windows ao chegar em 100% de cada arquivo!
+        """
+        if immediate:
+            self._save_queue_pending = False
+            threading.Thread(target=self._save_queue_state, daemon=True).start()
+            return
+        if self._save_queue_pending:
+            return
+        self._save_queue_pending = True
+
+        def _flush():
+            time.sleep(4.0)
+            self._save_queue_pending = False
+            self._save_queue_state()
+
+        threading.Thread(target=_flush, daemon=True).start()
+
+    def _schedule_queue_summary_update(self):
+        """Atualiza o resumo da fila com throttle de 0.35s para não sobrecarregar a UI em arquivos pequenos."""
+        if self._summary_update_pending:
+            return
+        self._summary_update_pending = True
+
+        def _do():
+            self._summary_update_pending = False
+            self._update_queue_summary()
+
+        self.after(350, _do)
+
     def _restore_saved_queue_state(self):
-        """Restaura as tarefas que estavam na fila (ou em execução) quando o programa fechou."""
+        """Restaura instantaneamente a fila salva sem fazer stat() síncrono em dezenas de milhares de arquivos."""
         if not QUEUE_STATE_FILE.exists():
             return
         try:
             state = json.loads(QUEUE_STATE_FILE.read_text(encoding="utf-8"))
             items_data = state.get("items", [])
             was_uploading = bool(state.get("was_uploading", False))
+            self.ignore_all_duplicates_session = bool(
+                state.get("ignore_all_duplicates", False)
+            )
             saved_target = state.get("target", "")
             restored_count = 0
             pending_count = 0
@@ -573,14 +671,9 @@ class TelegramUploaderApp(
                 if not p_str:
                     continue
                 p = Path(p_str)
-                if not p.exists() or not p.is_file():
-                    continue
                 if p in self.queued_paths:
                     continue
-                try:
-                    size = p.stat().st_size
-                except OSError:
-                    size = entry.get("size", 0)
+                size = int(entry.get("size", 0) or 0)
 
                 status = entry.get("status", "Pendente")
                 if size > MAX_TELEGRAM_FILE_SIZE:
@@ -649,14 +742,13 @@ class TelegramUploaderApp(
                 self.queue.append(item)
                 self.queue_by_id[item_id] = item
                 self.queued_paths.add(p)
-                if self._item_matches_filter(item):
-                    self._insert_item_row(item)
                 restored_count += 1
 
             if restored_count > 0:
+                self._rebuild_queue_tree()
                 self._update_queue_summary()
                 self.log(
-                    f"♻ Memória de Tarefas: {restored_count} arquivo(s) restaurado(s) da sessão anterior ({pending_count} pendente(s))."
+                    f"♻ Memória de Tarefas: {restored_count} arquivo(s) restaurado(s) instantaneamente ({pending_count} pendente(s))."
                 )
                 if was_uploading and pending_count > 0:
                     self.resume_upload_on_connect = True
@@ -715,12 +807,13 @@ class TelegramUploaderApp(
             pass
 
     def _on_app_closing(self):
-        """Salva estado da fila e configurações antes de fechar a janela."""
+        """Salva estado da fila, histórico e configurações antes de fechar a janela."""
         try:
             self._save_ui_prefs()
+            self._save_history()
             self._save_queue_state()
             append_persistent_log(
-                "Programa fechado pelo usuário (estado da fila salvo).", "INFO"
+                "Programa fechado pelo usuário (estado da fila e histórico salvos).", "INFO"
             )
         except Exception:
             pass
@@ -1529,6 +1622,43 @@ class TelegramUploaderApp(
             command=self.clear_all,
         ).pack(side="left", padx=4)
 
+        # Controles de Paginação Virtual na aba Upload (suporta 70.000+ arquivos na fila sem travar)
+        ul_page_frame = ctk.CTkFrame(btn_bar, fg_color="#0f172a", corner_radius=6)
+        ul_page_frame.pack(side="left", padx=(6, 4))
+
+        self.ul_prev_page_btn = ctk.CTkButton(
+            ul_page_frame,
+            text="◀",
+            width=28,
+            height=26,
+            fg_color="#1e293b",
+            hover_color="#2563eb",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self._change_ul_page(-1),
+        )
+        self.ul_prev_page_btn.pack(side="left", padx=(3, 2), pady=2)
+
+        self.ul_page_label = ctk.CTkLabel(
+            ul_page_frame,
+            text="Pág. 1/1",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#e2e8f0",
+            width=74,
+        )
+        self.ul_page_label.pack(side="left", padx=3)
+
+        self.ul_next_page_btn = ctk.CTkButton(
+            ul_page_frame,
+            text="▶",
+            width=28,
+            height=26,
+            fg_color="#1e293b",
+            hover_color="#2563eb",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self._change_ul_page(1),
+        )
+        self.ul_next_page_btn.pack(side="left", padx=(2, 3), pady=2)
+
         self.queue_summary_label = ctk.CTkLabel(
             btn_bar,
             text="0 arq. (0.0 B) | Pend: 0",
@@ -1736,15 +1866,30 @@ class TelegramUploaderApp(
         ctk.CTkButton(
             search_bar,
             text="Limpar Busca",
-            width=100,
+            width=96,
             fg_color="#475569",
             hover_color="#334155",
-            command=lambda: self.search_var.set(""),
+            command=self._clear_download_filters,
         ).grid(row=0, column=2, padx=3)
+
+        # Filtro por Tipo de Arquivo (PDF, Imagens, Word, Excel, Vídeos, Áudios, ZIP, EXE...)
+        self.dl_type_combo = ctk.CTkComboBox(
+            search_bar,
+            values=FILE_TYPE_FILTER_OPTIONS,
+            command=self._on_dl_type_filter_changed,
+            width=190,
+            height=32,
+            state="readonly",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#1e293b",
+            border_color="#38bdf8",
+        )
+        self.dl_type_combo.set("Todos os Tipos")
+        self.dl_type_combo.grid(row=0, column=3, padx=3)
 
         # Controles de Paginação Virtual (Suporte fluido a 150.000+ arquivos sem travar a Treeview)
         page_ctrl_frame = ctk.CTkFrame(search_bar, fg_color="#0f172a", corner_radius=6)
-        page_ctrl_frame.grid(row=0, column=3, padx=4)
+        page_ctrl_frame.grid(row=0, column=4, padx=3)
 
         self.dl_prev_page_btn = ctk.CTkButton(
             page_ctrl_frame,
@@ -1781,13 +1926,13 @@ class TelegramUploaderApp(
 
         self.scan_cloud_btn = ctk.CTkButton(
             search_bar,
-            text="🔄 Escanear Arquivos do Grupo",
-            width=200,
+            text="🔄 Escanear Grupo",
+            width=145,
             fg_color="#0284c7",
             hover_color="#0369a1",
             command=self.scan_current_group_files,
         )
-        self.scan_cloud_btn.grid(row=0, column=4, padx=(4, 4))
+        self.scan_cloud_btn.grid(row=0, column=5, padx=(3, 4))
 
         self.cloud_summary_label = ctk.CTkLabel(
             search_bar,
@@ -1796,10 +1941,10 @@ class TelegramUploaderApp(
             text_color="#38bdf8",
         )
         self.cloud_summary_label.grid(
-            row=0, column=5, padx=(4, 4), sticky="e"
+            row=0, column=6, padx=(4, 4), sticky="e"
         )
 
-        # Tabela de Arquivos Disponíveis na Nuvem do Grupo
+        # Tabela de Arquivos Disponíveis na Nuvem do Grupo (com Ícones/Miniaturas estilo Windows Explorer na coluna #0)
         dl_table_container = ctk.CTkFrame(self.tab_download, corner_radius=8)
         dl_table_container.grid(row=1, column=0, padx=8, pady=6, sticky="nsew")
         dl_table_container.grid_columnconfigure(0, weight=1)
@@ -1817,10 +1962,11 @@ class TelegramUploaderApp(
         self.dl_tree = ttk.Treeview(
             dl_table_container,
             columns=dl_cols,
-            show="headings",
+            show="tree headings",
             selectmode="extended",
             style="Dark.Treeview",
         )
+        self.dl_tree.heading("#0", text="", anchor="center")
         self.dl_tree.heading(
             "check",
             text="☑",
@@ -1836,7 +1982,8 @@ class TelegramUploaderApp(
         self.dl_tree.heading("status", text="Status", anchor="center")
         self.dl_tree.heading("progress", text="Download", anchor="e")
 
-        self.dl_tree.column("check", width=50, anchor="center", stretch=False)
+        self.dl_tree.column("#0", width=36, minwidth=36, anchor="center", stretch=False)
+        self.dl_tree.column("check", width=44, anchor="center", stretch=False)
         self.dl_tree.column("filename", width=340, anchor="w", stretch=True)
         self.dl_tree.column("ext", width=80, anchor="center", stretch=False)
         self.dl_tree.column("size", width=100, anchor="e", stretch=False)
@@ -2044,7 +2191,8 @@ class TelegramUploaderApp(
     def _populate_history_tree(self):
         for iid in self.history_tree.get_children():
             self.history_tree.delete(iid)
-        for rec in self.history_records:
+        # Renderiza apenas os 500 envios mais recentes na Treeview para inicialização instantânea
+        for rec in self.history_records[:500]:
             self.history_tree.insert(
                 "",
                 "end",
@@ -2708,7 +2856,10 @@ class TelegramUploaderApp(
             self.remote_files.extend(new_items)
 
         matching_new: List[RemoteCloudFile] = []
+        cat_filter = getattr(self, "dl_type_filter", "all")
         for rf in new_items:
+            if cat_filter != "all" and get_file_category(rf.ext) != cat_filter:
+                continue
             if query:
                 haystack = f"{rf.filename.lower()} {rf.ext.lower()} {rf.caption.lower()} {rf.date_str.lower()}"
                 if query not in haystack:
@@ -2807,12 +2958,26 @@ class TelegramUploaderApp(
         )
         self.log(f"Aviso ao sincronizar grupo em 2º plano: {exc}")
 
+    def _on_dl_type_filter_changed(self, selected_label: str):
+        self.dl_type_filter = FILTER_LABEL_TO_CATEGORY.get(selected_label, "all")
+        self._apply_download_search_filter()
+
+    def _clear_download_filters(self):
+        self.dl_type_filter = "all"
+        if hasattr(self, "dl_type_combo"):
+            self.dl_type_combo.set("Todos os Tipos")
+        self.search_var.set("")
+        self._apply_download_search_filter()
+
     def _apply_download_search_filter(self):
         self._dl_filter_render_token += 1
         query = self.search_var.get().strip().lower()
+        cat_filter = getattr(self, "dl_type_filter", "all")
 
         matching: List[RemoteCloudFile] = []
         for item in self.remote_files:
+            if cat_filter != "all" and get_file_category(item.ext) != cat_filter:
+                continue
             if query:
                 haystack = f"{item.filename.lower()} {item.ext.lower()} {item.caption.lower()} {item.date_str.lower()}"
                 if query not in haystack:
@@ -2875,20 +3040,23 @@ class TelegramUploaderApp(
 
     def _insert_dl_row(self, item: RemoteCloudFile):
         chk_str = "☑" if item.checked else "☐"
-        icon = "✓" if "✓" in item.status else "☁️"
         pct = "100%" if "✓" in item.status else f"{item.progress * 100:0.0f}%"
         tag = (
             "Marcado"
             if item.checked and item.status == "Disponível na Nuvem"
             else item.status
         )
+        cat = get_file_category(item.ext)
+        type_img = self.file_type_icons.get(cat) or self.file_type_icons.get("other")
         self.dl_tree.insert(
             "",
             "end",
             iid=item.row_id,
+            text="",
+            image=type_img,
             values=(
                 chk_str,
-                f"{icon} {item.filename}",
+                item.filename,
                 item.ext,
                 format_size(item.size) if item.size > 0 else "-",
                 item.date_str,
@@ -2917,13 +3085,13 @@ class TelegramUploaderApp(
 
     def _on_dl_tree_click(self, event):
         region = self.dl_tree.identify("region", event.x, event.y)
-        if region != "cell":
+        if region not in ("cell", "tree"):
             return
         col = self.dl_tree.identify_column(event.x)
         row_id = self.dl_tree.identify_row(event.y)
         if not row_id:
             return
-        if col == "#1" or (col == "#2" and event.x < 95):
+        if col in ("#0", "#1") or (col == "#2" and event.x < 120):
             self._toggle_dl_row_check(row_id)
             self._update_dl_checked_summary()
 
@@ -3229,11 +3397,8 @@ class TelegramUploaderApp(
         def _ui():
             if self.dl_tree.exists(item.row_id):
                 chk_str = "☑" if item.checked else "☐"
-                icon = "✓" if "✓" in status_tag else "☁️"
                 self.dl_tree.set(item.row_id, "check", chk_str)
-                self.dl_tree.set(
-                    item.row_id, "filename", f"{icon} {item.filename}"
-                )
+                self.dl_tree.set(item.row_id, "filename", item.filename)
                 self.dl_tree.set(item.row_id, "status", status_tag)
                 self.dl_tree.set(item.row_id, "progress", progress_text)
                 self.dl_tree.item(item.row_id, tags=(status_tag,))
@@ -3303,13 +3468,52 @@ class TelegramUploaderApp(
         except Exception:
             pass
 
-    def _rebuild_queue_tree(self):
+    def _total_ul_pages(self) -> int:
+        if not self.ul_filtered_items:
+            return 1
+        return max(1, math.ceil(len(self.ul_filtered_items) / self.ul_page_size))
+
+    def _update_ul_pagination_controls(self):
+        total_pages = self._total_ul_pages()
+        if self.ul_page_index >= total_pages:
+            self.ul_page_index = max(0, total_pages - 1)
+        cur_page = self.ul_page_index + 1
+        if hasattr(self, "ul_page_label"):
+            self.ul_page_label.configure(text=f"Pág. {cur_page}/{total_pages}")
+        if hasattr(self, "ul_prev_page_btn"):
+            self.ul_prev_page_btn.configure(
+                state="normal" if self.ul_page_index > 0 else "disabled"
+            )
+        if hasattr(self, "ul_next_page_btn"):
+            self.ul_next_page_btn.configure(
+                state="normal" if self.ul_page_index + 1 < total_pages else "disabled"
+            )
+
+    def _change_ul_page(self, delta: int):
+        total_pages = self._total_ul_pages()
+        new_idx = max(0, min(total_pages - 1, self.ul_page_index + delta))
+        if new_idx == self.ul_page_index:
+            return
+        self.ul_page_index = new_idx
+        self._render_current_upload_page()
+
+    def _render_current_upload_page(self):
+        """Renderiza apenas a página atual (máx 500 linhas) na Treeview de Upload."""
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        for item in self.queue:
-            if self._item_matches_filter(item):
-                self._insert_item_row(item)
+        self._update_ul_pagination_controls()
+        start = self.ul_page_index * self.ul_page_size
+        end = min(start + self.ul_page_size, len(self.ul_filtered_items))
+        for i in range(start, end):
+            self._insert_item_row(self.ul_filtered_items[i])
         self._sync_upload_tree_height()
+
+    def _rebuild_queue_tree(self):
+        self.ul_filtered_items = [
+            item for item in self.queue if self._item_matches_filter(item)
+        ]
+        self.ul_page_index = 0
+        self._render_current_upload_page()
 
     def _insert_item_row(self, item: FileQueueItem):
         chk_str = "☑" if item.checked else "☐"
@@ -3824,10 +4028,13 @@ class TelegramUploaderApp(
             self.queued_paths.add(fpath)
 
             if self._item_matches_filter(item):
-                self._insert_item_row(item)
+                self.ul_filtered_items.append(item)
+                if len(self.tree.get_children()) < self.ul_page_size and self.ul_page_index == 0:
+                    self._insert_item_row(item)
 
             added_so_far += 1
 
+        self._update_ul_pagination_controls()
         self._update_queue_summary()
 
         if end_idx < len(files_with_sizes):
@@ -3889,8 +4096,9 @@ class TelegramUploaderApp(
             self.queue = [
                 i for i in self.queue if i.item_id in self.queue_by_id
             ]
+            self._rebuild_queue_tree()
             self._update_queue_summary()
-            self._save_queue_state()
+            self._schedule_save_queue_state(immediate=True)
             self.log(
                 f"🗑 {removed} arquivo(s) ignorado(s) e removido(s) da lista de upload."
             )
@@ -3907,8 +4115,12 @@ class TelegramUploaderApp(
         self.queue.clear()
         self.queue_by_id.clear()
         self.queued_paths.clear()
+        self.ul_filtered_items.clear()
+        self.ul_page_index = 0
+        self.ignore_all_duplicates_session = False
+        self._update_ul_pagination_controls()
         self._update_queue_summary()
-        self._save_queue_state()
+        self._schedule_save_queue_state(immediate=True)
         self.file_progress_bar.set(0)
         self.total_progress_bar.set(0)
         self.current_file_label.configure(text="Fila de upload limpa.")
@@ -4226,8 +4438,9 @@ class TelegramUploaderApp(
                     self.tree.delete(item.item_id)
                 return
 
+            # Só atualiza na Treeview se o item estiver na página atual (nunca insere 70.000 linhas no Tkinter!)
             if not self.tree.exists(item.item_id):
-                self._insert_item_row(item)
+                return
 
             chk_str = "☑" if item.checked else "☐"
             icon = "✓" if status_tag in ("Concluído", "Já Enviado") else "📄"
