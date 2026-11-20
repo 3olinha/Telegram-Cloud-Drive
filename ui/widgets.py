@@ -9,7 +9,140 @@ import math
 import tkinter as tk
 from typing import Dict, Optional
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+
+FILE_TYPE_FILTER_OPTIONS = [
+    "Todos os Tipos",
+    "PDF (.pdf)",
+    "Imagens (.jpg, .png, .webp)",
+    "Word / Texto (.doc, .docx, .txt)",
+    "Excel / Planilhas (.xls, .xlsx, .csv)",
+    "PowerPoint (.ppt, .pptx)",
+    "Vídeos (.mp4, .mkv, .avi, .mov)",
+    "Áudios (.mp3, .wav, .ogg)",
+    "Compactados (.zip, .rar, .7z)",
+    "Programas (.exe, .msi, .apk)",
+    "Outros",
+]
+
+_EXT_TO_CATEGORY = {
+    ".pdf": "pdf",
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".gif": "image",
+    ".bmp": "image", ".webp": "image", ".svg": "image", ".ico": "image",
+    ".tif": "image", ".tiff": "image", ".heic": "image", ".psd": "image",
+    ".doc": "word", ".docx": "word", ".odt": "word", ".rtf": "word", ".txt": "word", ".md": "word",
+    ".xls": "excel", ".xlsx": "excel", ".xlsm": "excel", ".ods": "excel", ".csv": "excel",
+    ".ppt": "ppt", ".pptx": "ppt", ".odp": "ppt",
+    ".mp4": "video", ".mkv": "video", ".avi": "video", ".mov": "video",
+    ".wmv": "video", ".flv": "video", ".webm": "video", ".m4v": "video", ".3gp": "video",
+    ".mp3": "audio", ".wav": "audio", ".ogg": "audio", ".flac": "audio",
+    ".aac": "audio", ".m4a": "audio", ".wma": "audio", ".opus": "audio",
+    ".zip": "archive", ".rar": "archive", ".7z": "archive", ".tar": "archive",
+    ".gz": "archive", ".bz2": "archive", ".iso": "archive",
+    ".exe": "exe", ".msi": "exe", ".bat": "exe", ".cmd": "exe", ".apk": "exe", ".appx": "exe",
+}
+
+FILTER_LABEL_TO_CATEGORY = {
+    "Todos os Tipos": "all",
+    "PDF (.pdf)": "pdf",
+    "Imagens (.jpg, .png, .webp)": "image",
+    "Word / Texto (.doc, .docx, .txt)": "word",
+    "Excel / Planilhas (.xls, .xlsx, .csv)": "excel",
+    "PowerPoint (.ppt, .pptx)": "ppt",
+    "Vídeos (.mp4, .mkv, .avi, .mov)": "video",
+    "Áudios (.mp3, .wav, .ogg)": "audio",
+    "Compactados (.zip, .rar, .7z)": "archive",
+    "Programas (.exe, .msi, .apk)": "exe",
+    "Outros": "other",
+}
+
+
+def get_file_category(ext: str) -> str:
+    """Retorna a categoria visual do arquivo com base na extensão (ex: '.pdf' -> 'pdf')."""
+    e = (ext or "").strip().lower()
+    if e and not e.startswith("."):
+        e = "." + e
+    return _EXT_TO_CATEGORY.get(e, "other")
+
+
+def create_file_type_icons() -> Dict[str, ImageTk.PhotoImage]:
+    """
+    Gera miniaturas/ícones nítidos estilo Windows Explorer (22x22 com supersampling 4x)
+    para exibição direta nas linhas do Treeview (PDF, Imagem, Word, Excel, Vídeo, ZIP, EXE, etc.).
+    """
+    S = 88
+    OUT = (22, 22)
+
+    def _base_doc(accent_rgba, badge_text="", draw_fn=None) -> ImageTk.PhotoImage:
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        # Folha branca com canto superior direito dobrado (estilo Windows)
+        poly = [(14, 6), (56, 6), (74, 24), (74, 82), (14, 82)]
+        d.polygon(poly, fill=(248, 250, 252, 255), outline=(148, 163, 184, 255))
+        d.line([(14, 6), (56, 6), (74, 24), (74, 82), (14, 82), (14, 6)], fill=(100, 116, 139, 255), width=3)
+        # Dobra do canto
+        d.polygon([(56, 6), (56, 24), (74, 24)], fill=(203, 213, 225, 255), outline=(100, 116, 139, 255))
+
+        if draw_fn is not None:
+            draw_fn(d)
+        elif badge_text:
+            # Faixa colorida estilo documento Windows (PDF vermelho, Word azul, Excel verde, PPT laranja)
+            d.rounded_rectangle((8, 42, 80, 74), radius=8, fill=accent_rgba)
+            try:
+                fnt = ImageFont.truetype("segoeuib.ttf", 22 if len(badge_text) <= 3 else 18)
+            except Exception:
+                fnt = ImageFont.load_default()
+            bbox = d.textbbox((0, 0), badge_text, font=fnt)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            d.text(((S - tw) // 2, 58 - th // 2 - 2), badge_text, fill=(255, 255, 255, 255), font=fnt)
+
+        small = img.resize(OUT, Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(small)
+
+    def _draw_image(d):
+        # Quadro de foto com céu azul, sol e montanhas (igual miniatura de imagem do Windows)
+        d.rounded_rectangle((20, 30, 68, 74), radius=4, fill=(14, 165, 233, 255), outline=(2, 132, 199, 255), width=3)
+        d.ellipse((50, 36, 62, 48), fill=(253, 224, 71, 255))
+        d.polygon([(22, 72), (38, 48), (52, 72)], fill=(15, 118, 110, 255))
+        d.polygon([(42, 72), (55, 54), (66, 72)], fill=(20, 184, 166, 255))
+
+    def _draw_video(d):
+        d.rounded_rectangle((18, 34, 70, 72), radius=8, fill=(124, 58, 237, 255))
+        d.polygon([(38, 43), (38, 63), (58, 53)], fill=(255, 255, 255, 255))
+
+    def _draw_audio(d):
+        d.rounded_rectangle((18, 34, 70, 72), radius=8, fill=(6, 182, 212, 255))
+        d.ellipse((30, 56, 42, 66), fill=(255, 255, 255, 255))
+        d.ellipse((48, 52, 60, 62), fill=(255, 255, 255, 255))
+        d.line([(41, 60), (41, 41), (59, 38), (59, 56)], fill=(255, 255, 255, 255), width=4)
+
+    def _draw_archive(d):
+        d.rounded_rectangle((16, 30, 72, 74), radius=8, fill=(217, 119, 6, 255), outline=(180, 83, 9, 255), width=3)
+        for y in range(34, 70, 8):
+            d.rectangle((40, y, 48, y + 4), fill=(254, 243, 199, 255))
+
+    def _draw_exe(d):
+        d.rounded_rectangle((18, 32, 70, 72), radius=6, fill=(37, 99, 235, 255), outline=(30, 64, 175, 255), width=3)
+        d.rectangle((22, 36, 66, 44), fill=(96, 165, 250, 255))
+        d.ellipse((35, 49, 53, 67), outline=(255, 255, 255, 255), width=4)
+
+    def _draw_other(d):
+        for y in (36, 48, 60):
+            d.line([(24, y), (64, y)], fill=(148, 163, 184, 255), width=4)
+
+    return {
+        "pdf": _base_doc((220, 38, 38, 255), "PDF"),
+        "image": _base_doc((2, 132, 199, 255), draw_fn=_draw_image),
+        "word": _base_doc((29, 78, 216, 255), "DOC"),
+        "excel": _base_doc((21, 128, 61, 255), "XLS"),
+        "ppt": _base_doc((234, 88, 12, 255), "PPT"),
+        "video": _base_doc((124, 58, 237, 255), draw_fn=_draw_video),
+        "audio": _base_doc((6, 182, 212, 255), draw_fn=_draw_audio),
+        "archive": _base_doc((217, 119, 6, 255), draw_fn=_draw_archive),
+        "exe": _base_doc((37, 99, 235, 255), draw_fn=_draw_exe),
+        "other": _base_doc((100, 116, 139, 255), draw_fn=_draw_other),
+    }
 
 
 def _create_nav_icons() -> Dict[str, ctk.CTkImage]:
