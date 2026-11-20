@@ -337,6 +337,19 @@ class GitHubUpdaterMixin:
         from ui.widgets import LabeledProgressBar
 
         if (
+            hasattr(self, "welcome_win")
+            and self.welcome_win is not None
+            and self.welcome_win.winfo_exists()
+        ):
+            self.after(
+                1500,
+                lambda: self._show_update_available_dialog(
+                    remote_ver, release_title, release_notes, download_url, asset_size
+                ),
+            )
+            return
+
+        if (
             hasattr(self, "update_win")
             and self.update_win is not None
             and self.update_win.winfo_exists()
