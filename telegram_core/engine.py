@@ -150,6 +150,10 @@ class TelegramTransferEngineMixin:
         """Retoma automaticamente o upload de tarefas que estavam em andamento quando o programa fechou."""
         if self.is_uploading or not self.connected_mode:
             return
+        # Aguarda o usuário fechar modais iniciais (Como Usar / Atualização) para não empilhar janelas
+        if self._has_blocking_modal_open():
+            self.after(1500, self._auto_resume_interrupted_upload)
+            return
         pending = [
             it
             for it in self.queue
@@ -1035,19 +1039,34 @@ class TelegramTransferEngineMixin:
         target_entity: Union[int, str],
         target_label: str,
     ):
-        total_count = len(items)
-        completed_count = 0
+        # Contabiliza arquivos já concluídos na mesma fila para NÃO zerar o progresso total ao reiniciar
+        already_done_count = sum(
+            1 for it in self.queue if it.status in ("Concluído", "Já Enviado")
+        )
+        already_done_bytes = sum(
+            max(it.size, 0)
+            for it in self.queue
+            if it.status in ("Concluído", "Já Enviado")
+        )
+        total_count = already_done_count + len(items)
+        completed_count = already_done_count
         current_batch = list(items)
         cycle_number = 1
-        ignore_all_duplicates = False
+        # Preserva a escolha "IGNORAR TODOS" caso o usuário já tenha marcado na mesma fila antes de fechar
+        ignore_all_duplicates = bool(
+            getattr(self, "ignore_all_duplicates_session", False)
+        )
         check_duplicates = getattr(self, "_snap_ignore_duplicates", True)
         use_caption = getattr(self, "_snap_use_caption", False)
         caption_tpl = getattr(self, "_snap_caption_tpl", "{filename}")
+        session_start_t = time.time()
+        session_bytes_transferred = 0
 
         while current_batch and not self.cancel_requested and not self.is_paused:
             deferred_for_1h: List[FileQueueItem] = []
             batch_total_bytes = max(
-                sum(
+                already_done_bytes
+                + sum(
                     max(it.size, 0)
                     for it in current_batch
                     if it.size <= MAX_TELEGRAM_FILE_SIZE
@@ -1057,7 +1076,7 @@ class TelegramTransferEngineMixin:
                 ),
                 1,
             )
-            completed_batch_bytes = 0
+            completed_batch_bytes = already_done_bytes
 
             for idx, item in enumerate(current_batch, start=1):
                 if item.item_id not in self.queue_by_id or getattr(
@@ -1078,8 +1097,8 @@ class TelegramTransferEngineMixin:
                     self.log(
                         f"⏭ Ignorado (> 2 GB): '{item.path.name}' ({format_size(item.size)}) excede o limite de 2 GB do Telegram."
                     )
-                    self.after(0, self._update_queue_summary)
-                    self.after(0, self._save_queue_state)
+                    self._schedule_queue_summary_update()
+                    self._schedule_save_queue_state()
                     continue
 
                 if item.status in (
@@ -1099,7 +1118,8 @@ class TelegramTransferEngineMixin:
                             batch_total_bytes = max(
                                 1, batch_total_bytes - max(item.size, 0)
                             )
-                            self.after(0, self._update_queue_summary)
+                            self._schedule_queue_summary_update()
+                            self._schedule_save_queue_state()
                             continue
 
                         self.after(
@@ -1113,21 +1133,21 @@ class TelegramTransferEngineMixin:
                         )
                         if dup_choice == "ignore_all":
                             ignore_all_duplicates = True
+                            self.ignore_all_duplicates_session = True
                             skipped_now = 0
                             for rem_item in current_batch[idx - 1 :]:
                                 if self._file_exists_in_download_scan(rem_item):
-                                    self._update_item_ui(
-                                        rem_item, "Ignorado (Repetido)", "Ignorado"
-                                    )
+                                    rem_item.status = "Ignorado (Repetido)"
                                     batch_total_bytes = max(
                                         1, batch_total_bytes - max(rem_item.size, 0)
                                     )
                                     skipped_now += 1
+                            self.after(0, self._render_current_upload_page)
                             self.log(
                                 f"⏭ IGNORAR TODOS ativado: {skipped_now} arquivo(s) repetido(s) ignorado(s) de uma só vez! Enviando apenas os arquivos novos."
                             )
-                            self.after(0, self._update_queue_summary)
-                            self.after(0, self._save_queue_state)
+                            self._schedule_queue_summary_update()
+                            self._schedule_save_queue_state()
                             continue
                         elif dup_choice != "yes":
                             self._update_item_ui(
@@ -1139,8 +1159,8 @@ class TelegramTransferEngineMixin:
                             self.log(
                                 f"⏭ Ignorado (Repetido): '{item.path.name}' já existe na varredura de Downloads."
                             )
-                            self.after(0, self._update_queue_summary)
-                            self.after(0, self._save_queue_state)
+                            self._schedule_queue_summary_update()
+                            self._schedule_save_queue_state()
                             continue
 
                 caption = ""
@@ -1170,12 +1190,12 @@ class TelegramTransferEngineMixin:
                         self.log(
                             f"❌ Erro permanente em '{item.path.name}': Arquivo não existe mais no disco ({item.path}). Pulando imediatamente."
                         )
-                        self.after(0, self._update_queue_summary)
-                        self.after(0, self._save_queue_state)
+                        self._schedule_queue_summary_update()
+                        self._schedule_save_queue_state()
                         break
 
-                    # Calcula assinatura SHA-256 de verificação para arquivos (> 10 MB ou ainda sem hash)
-                    if not item.sha256:
+                    # Calcula assinatura SHA-256 apenas para arquivos grandes (>= 10 MB)
+                    if not item.sha256 and item.size >= LARGE_FILE_THRESHOLD:
                         try:
                             item.sha256 = await asyncio.to_thread(
                                 compute_fast_file_sha256, item.path
@@ -1196,7 +1216,7 @@ class TelegramTransferEngineMixin:
                     )
                     self.after(
                         0,
-                        lambda name=item.path.name, i=idx, t=len(current_batch), sfx=att_suffix: self.current_file_label.configure(
+                        lambda name=item.path.name, i=completed_count + 1, t=total_count, sfx=att_suffix: self.current_file_label.configure(
                             text=f"Enviando ({i}/{t}): {name}{sfx}"
                         ),
                     )
@@ -1230,7 +1250,7 @@ class TelegramTransferEngineMixin:
                             )
 
                         now = time.time()
-                        if sent_bytes < total_bytes and (now - last_upd[0]) < 0.07:
+                        if sent_bytes < total_bytes and (now - last_upd[0]) < 0.12:
                             return
                         last_upd[0] = now
 
@@ -1239,7 +1259,12 @@ class TelegramTransferEngineMixin:
                         current_item.progress = frac
                         elapsed = max(now - t0, 0.001)
                         speed_bps = sent_bytes / elapsed
-                        speed_mb = speed_bps / (1024 * 1024)
+                        sess_elapsed = max(now - session_start_t, 0.1)
+                        avg_speed_bps = max(
+                            (session_bytes_transferred + sent_bytes) / sess_elapsed,
+                            speed_bps,
+                        )
+                        speed_mb = avg_speed_bps / (1024 * 1024)
                         overall_frac = min(
                             (prev_b + sent_bytes) / max(tot_batch_b, 1),
                             1.0,
@@ -1254,8 +1279,8 @@ class TelegramTransferEngineMixin:
                         )
                         rem_total_b = max(0, tot_batch_b - (prev_b + sent_bytes))
                         total_eta_str = (
-                            format_eta(rem_total_b / speed_bps)
-                            if speed_bps > 0
+                            format_eta(rem_total_b / avg_speed_bps)
+                            if avg_speed_bps > 0
                             else "calculando..."
                         )
 
@@ -1298,6 +1323,7 @@ class TelegramTransferEngineMixin:
 
                         completed_count += 1
                         completed_batch_bytes += max(item.size, 0)
+                        session_bytes_transferred += max(item.size, 0)
                         item.progress = 1.0
                         self._record_sent_file(item, target_label)
                         self._update_item_ui(item, "Concluído", "100%")
@@ -1309,8 +1335,8 @@ class TelegramTransferEngineMixin:
                         self.log(
                             f"✓ Enviado ({completed_count}/{total_count}): {item.path.name}{sha_info}"
                         )
-                        self.after(0, self._update_queue_summary)
-                        self.after(0, self._save_queue_state)
+                        self._schedule_queue_summary_update()
+                        self._schedule_save_queue_state()
                         break
 
                     except ItemDeletedFromQueueError:
@@ -1320,21 +1346,21 @@ class TelegramTransferEngineMixin:
                         self.log(
                             f"🗑 Envio de '{item.path.name}' interrompido e ignorado (arquivo excluído da lista)."
                         )
-                        self.after(0, self._update_queue_summary)
-                        self.after(0, self._save_queue_state)
+                        self._schedule_queue_summary_update()
+                        self._schedule_save_queue_state()
                         break
                     except TransferPausedError:
                         self._update_item_ui(
                             item, "Pausado", f"{item.progress * 100:0.0f}%"
                         )
-                        self.after(0, self._save_queue_state)
+                        self._schedule_save_queue_state(immediate=True)
                         break
                     except asyncio.CancelledError:
                         self._update_item_ui(
                             item, "Cancelado", f"{item.progress * 100:0.0f}%"
                         )
                         self.log(f"■ Envio interrompido: {item.path.name}")
-                        self.after(0, self._save_queue_state)
+                        self._schedule_save_queue_state(immediate=True)
                         break
                     except errors.FloodWaitError as fw:
                         wait_sec = fw.seconds
@@ -1360,8 +1386,8 @@ class TelegramTransferEngineMixin:
                             self.log(
                                 f"❌ Erro permanente ao enviar '{item.path.name}' (não será repetido em 1h): {reason}"
                             )
-                            self.after(0, self._update_queue_summary)
-                            self.after(0, self._save_queue_state)
+                            self._schedule_queue_summary_update()
+                            self._schedule_save_queue_state()
                             break
 
                         self._update_item_ui(
