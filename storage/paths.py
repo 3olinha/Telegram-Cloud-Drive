@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_NAME = "Telegram Cloud Drive"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_SUBTITLE = "Gerenciador de Upload e Download de arquivos para Telegram"
