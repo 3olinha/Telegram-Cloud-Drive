@@ -9,7 +9,7 @@ import winreg
 from pathlib import Path
 from tkinter import messagebox
 
-APP_VERSION = "0.13"
+APP_VERSION = "0.14"
 APP_NAME = "Telegram Cloud Drive"
 INSTALL_FOLDER_NAME = "TelegramCloudDrive"
 UNINSTALL_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\TelegramCloudDrive"
