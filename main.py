@@ -39,6 +39,7 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
     InputFile,
     InputFileBig,
+    InputMessagesFilterDocument,
     MessageMediaDocument,
     MessageMediaPhoto,
 )
@@ -52,7 +53,7 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-APP_VERSION = "0.13"
+APP_VERSION = "0.14"
 APP_NAME = "Telegram Cloud Drive"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_SUBTITLE = "Gerenciador de Upload e Download de arquivos para Telegram"
@@ -138,6 +139,7 @@ USER_DATA_DIR = get_local_user_data_dir()
 CONFIG_FILE = USER_DATA_DIR / "config.json"
 HISTORY_FILE = USER_DATA_DIR / "sent_history.json"
 QUEUE_STATE_FILE = USER_DATA_DIR / "queue_state.json"
+GROUP_CACHE_FILE = USER_DATA_DIR / "group_cloud_cache.json"
 LOG_FILE = USER_DATA_DIR / "app_activity.log"
 CRASH_LOG_FILE = USER_DATA_DIR / "crash_trace.log"
 SESSION_PERSONAL = str(USER_DATA_DIR / "session_personal")
@@ -663,8 +665,10 @@ class TelegramUploaderApp(ctk.CTk):
         # Estruturas da Aba Download (Drive / Nuvem Telegram)
         self.remote_files: List[RemoteCloudFile] = []
         self.remote_by_id: Dict[str, RemoteCloudFile] = {}
+        self.remote_by_filename_lower: Dict[str, RemoteCloudFile] = {}
         self.is_scanning_remote = False
         self._remote_scan_token = 0
+        self._dl_filter_render_token = 0
 
         # Estados de Transferência
         self.is_uploading = False
@@ -2185,17 +2189,19 @@ del "%~f0" >nul 2>&1
 
     def _update_scan_lock_ui(self, detail_msg: str = ""):
         """
-        Exibe/oculta o aviso central 'Lendo os arquivos, aguarde...' e deixa os botões
-        Iniciar/Pausar cinzas (desabilitados) enquanto estiver lendo arquivos de upload ou download.
+        Exibe/oculta o aviso central 'Lendo os arquivos, aguarde...' APENAS durante a leitura
+        de pastas locais grandes no PC (self.is_scanning).
+        A varredura do grupo no Telegram (self.is_scanning_remote) roda 100% em segundo plano
+        sem bloquear o uso do programa e sem desabilitar os botões Iniciar Upload / Download.
         """
-        busy = bool(self.is_scanning or self.is_scanning_remote)
+        busy = bool(self.is_scanning)
         sub_txt = (
             detail_msg
             if detail_msg
-            else "Aguarde o término da varredura para evitar travamentos..."
+            else "Aguarde o término da leitura local para evitar travamentos..."
         )
 
-        # Atualiza aviso central na aba Upload e na aba Download
+        # Atualiza aviso central na aba Upload apenas quando estiver lendo pastas do computador
         if hasattr(self, "upload_loading_overlay"):
             if busy:
                 self.upload_loading_sub_label.configure(text=sub_txt)
@@ -2205,12 +2211,7 @@ del "%~f0" >nul 2>&1
                 self.upload_loading_overlay.place_forget()
 
         if hasattr(self, "download_loading_overlay"):
-            if busy:
-                self.download_loading_sub_label.configure(text=sub_txt)
-                self.download_loading_overlay.place(relx=0.5, rely=0.5, anchor="center")
-                self.download_loading_overlay.lift()
-            else:
-                self.download_loading_overlay.place_forget()
+            self.download_loading_overlay.place_forget()
 
         # Atualiza cor/estado dos botões Iniciar/Pausar (Cinza quando lendo, Colorido quando pronto)
         if hasattr(self, "start_btn"):
@@ -3567,163 +3568,407 @@ del "%~f0" >nul 2>&1
     # -------------------------------------------------------------------------
     # GERENCIADOR DE DOWNLOAD (Varredura Automática, Busca e Download do Grupo)
     # -------------------------------------------------------------------------
-    def scan_current_group_files(self):
+    # -------------------------------------------------------------------------
+    # GERENCIADOR DE DOWNLOAD (Varredura Rápida em 2º Plano + Cache Incremental)
+    # -------------------------------------------------------------------------
+    def _load_group_cache_entry(self, entity_key: str) -> dict:
+        if not GROUP_CACHE_FILE.exists():
+            return {}
+        try:
+            all_cache = json.loads(GROUP_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(all_cache, dict):
+                return all_cache.get(str(entity_key), {}) or {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_group_cache_entry(
+        self,
+        entity_key: str,
+        files_list: List[RemoteCloudFile],
+        fully_scanned: bool,
+    ):
+        try:
+            all_cache = {}
+            if GROUP_CACHE_FILE.exists():
+                try:
+                    loaded = json.loads(GROUP_CACHE_FILE.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        all_cache = loaded
+                except Exception:
+                    all_cache = {}
+
+            msg_ids = [f.message_id for f in files_list if f.message_id]
+            min_id = min(msg_ids) if msg_ids else 0
+            max_id = max(msg_ids) if msg_ids else 0
+            serialized_files = [
+                {
+                    "id": f.message_id,
+                    "fn": f.filename,
+                    "ext": f.ext,
+                    "sz": f.size,
+                    "dt": f.date_str,
+                    "cap": f.caption,
+                }
+                for f in files_list
+            ]
+            all_cache[str(entity_key)] = {
+                "min_id": min_id,
+                "max_id": max_id,
+                "fully_scanned": bool(fully_scanned),
+                "files": serialized_files,
+            }
+            GROUP_CACHE_FILE.write_text(
+                json.dumps(all_cache, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def scan_current_group_files(self, force_full_rescan: bool = False):
         if self.connected_mode != "personal" or not self.client:
             return
 
         target_label = self.target_combo.get()
         target_entity = self.dialogs_map.get(target_label, "me")
+        entity_key = str(target_entity)
 
         self._remote_scan_token += 1
         current_token = self._remote_scan_token
         self.is_scanning_remote = True
 
-        self.scan_cloud_btn.configure(state="disabled", text="⏳ Escaneando Grupo...")
-        self.cloud_summary_label.configure(text="Buscando arquivos no grupo...")
-        self.current_file_label.configure(
-            text=f"⏳ Lendo os arquivos, aguarde... Varrendo: {target_label}"
+        self.scan_cloud_btn.configure(
+            state="disabled", text="⏳ Sincronizando em 2º plano..."
         )
-        self._update_scan_lock_ui(f"Varrendo arquivos disponíveis em: {target_label}...")
-        self.log(f"🔍 Varrendo arquivos disponíveis no grupo: {target_label}...")
 
         self.remote_files.clear()
         self.remote_by_id.clear()
+        self.remote_by_filename_lower.clear()
         for iid in self.dl_tree.get_children():
             self.dl_tree.delete(iid)
 
-        self.worker.run_coro(
-            self._async_scan_group_files(target_entity, current_token),
-            callback=lambda res: self._on_scan_group_done(
-                res, target_label, current_token
-            ),
-            error_callback=lambda e: self._on_scan_group_error(e),
-        )
-
-    async def _async_scan_group_files(
-        self, target_entity: Union[int, str], token: int
-    ) -> List[RemoteCloudFile]:
-        if not self.client.is_connected():
-            await self.client.connect()
-
-        found: List[RemoteCloudFile] = []
         dl_dir = Path(
             self.config_data.get("download_dir", str(DEFAULT_DOWNLOAD_DIR))
         )
 
-        # Varre TODOS os arquivos do grupo sem limite de 2500 (limit=None)
-        async for msg in self.client.iter_messages(target_entity, limit=None):
-            if token != self._remote_scan_token:
-                break
-            if not msg or not msg.media:
-                continue
+        # 1. Carrega instantaneamente o cache local deste grupo (se existir e não for forçado reset total)
+        cache_entry = (
+            {} if force_full_rescan else self._load_group_cache_entry(entity_key)
+        )
+        cached_raw_list = cache_entry.get("files") or []
+        min_cached_id = int(cache_entry.get("min_id", 0) or 0)
+        max_cached_id = int(cache_entry.get("max_id", 0) or 0)
+        fully_scanned = bool(cache_entry.get("fully_scanned", False))
 
-            filename = ""
-            size = 0
-
-            if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
-                doc = msg.media.document
-                size = getattr(doc, "size", 0) or 0
-                for attr in getattr(doc, "attributes", []):
-                    if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
-                        filename = attr.file_name
-                        break
-                if not filename:
-                    mime = getattr(doc, "mime_type", "") or ""
-                    ext_guess = "." + mime.split("/")[-1] if "/" in mime else ".bin"
-                    filename = f"arquivo_{msg.id}{ext_guess}"
-            elif isinstance(msg.media, MessageMediaPhoto) and msg.media.photo:
-                filename = f"foto_{msg.id}.jpg"
-                sizes = getattr(msg.media.photo, "sizes", [])
-                if sizes:
-                    last_sz = sizes[-1]
-                    size = getattr(last_sz, "size", 0) or 0
-            else:
-                continue
-
-            ext = Path(filename).suffix.lower() or "-"
-            date_str = (
-                msg.date.astimezone().strftime("%d/%m/%Y %H:%M")
-                if getattr(msg, "date", None)
-                else "-"
-            )
-            row_id = f"dl_{msg.id}"
-
-            local_candidate = dl_dir / filename
-            status = (
-                "Já no PC ✓"
-                if (
-                    local_candidate.exists()
-                    and (size == 0 or local_candidate.stat().st_size == size)
+        if cached_raw_list:
+            for entry in cached_raw_list:
+                mid = int(entry.get("id", 0) or 0)
+                if not mid:
+                    continue
+                fname = str(entry.get("fn", f"arquivo_{mid}"))
+                fsize = int(entry.get("sz", 0) or 0)
+                row_id = f"dl_{mid}"
+                if row_id in self.remote_by_id:
+                    continue
+                local_candidate = dl_dir / fname
+                status = (
+                    "Já no PC ✓"
+                    if (
+                        local_candidate.exists()
+                        and (fsize == 0 or local_candidate.stat().st_size == fsize)
+                    )
+                    else "Disponível na Nuvem"
                 )
-                else "Disponível na Nuvem"
+                rf = RemoteCloudFile(
+                    row_id=row_id,
+                    message_id=mid,
+                    filename=fname,
+                    ext=str(entry.get("ext", Path(fname).suffix.lower() or "-")),
+                    size=fsize,
+                    date_str=str(entry.get("dt", "-")),
+                    caption=str(entry.get("cap", "")),
+                    status=status,
+                    progress=1.0 if status == "Já no PC ✓" else 0.0,
+                    message_obj=None,
+                )
+                self.remote_files.append(rf)
+                self.remote_by_id[row_id] = rf
+                self.remote_by_filename_lower[fname.lower()] = rf
+
+            self._apply_download_search_filter()
+            if "download" in self.nav_buttons:
+                self.nav_buttons["download"].configure(
+                    text=f"  DOWNLOAD DO TELEGRAM ({len(self.remote_files)})"
+                )
+            self.log(
+                f"⚡ {len(self.remote_files)} arquivo(s) carregados instantaneamente do cache de '{target_label}'. Sincronizando novos em 2º plano..."
+            )
+        else:
+            self.cloud_summary_label.configure(
+                text="Sincronizando arquivos em 2º plano..."
+            )
+            self.log(
+                f"🔍 Sincronizando arquivos do grupo '{target_label}' em 2º plano (você já pode usar o programa normalmente)..."
             )
 
-            cloud_item = RemoteCloudFile(
-                row_id=row_id,
-                message_id=msg.id,
-                filename=filename,
-                ext=ext,
-                size=size,
-                date_str=date_str,
-                caption=(msg.message or "").strip(),
-                status=status,
-                progress=1.0 if status == "Já no PC ✓" else 0.0,
-                message_obj=msg,
-            )
-            found.append(cloud_item)
+        self.worker.run_coro(
+            self._async_scan_group_files(
+                target_entity,
+                target_label,
+                entity_key,
+                current_token,
+                min_cached_id,
+                max_cached_id,
+                fully_scanned,
+            ),
+            callback=lambda res: self._on_scan_group_done(
+                res, target_label, entity_key, current_token
+            ),
+            error_callback=lambda e: self._on_scan_group_error(e),
+        )
 
-            if len(found) % 100 == 0:
-                count_now = len(found)
+    def _extract_remote_file_from_msg(
+        self, msg, dl_dir: Path
+    ) -> Optional[RemoteCloudFile]:
+        if not msg or not msg.media:
+            return None
+        filename = ""
+        size = 0
+        if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
+            doc = msg.media.document
+            size = getattr(doc, "size", 0) or 0
+            for attr in getattr(doc, "attributes", []):
+                if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                    filename = attr.file_name
+                    break
+            if not filename:
+                mime = getattr(doc, "mime_type", "") or ""
+                ext_guess = "." + mime.split("/")[-1] if "/" in mime else ".bin"
+                filename = f"arquivo_{msg.id}{ext_guess}"
+        elif isinstance(msg.media, MessageMediaPhoto) and msg.media.photo:
+            filename = f"foto_{msg.id}.jpg"
+            sizes = getattr(msg.media.photo, "sizes", [])
+            if sizes:
+                last_sz = sizes[-1]
+                size = getattr(last_sz, "size", 0) or 0
+        else:
+            return None
+
+        ext = Path(filename).suffix.lower() or "-"
+        date_str = (
+            msg.date.astimezone().strftime("%d/%m/%Y %H:%M")
+            if getattr(msg, "date", None)
+            else "-"
+        )
+        row_id = f"dl_{msg.id}"
+        local_candidate = dl_dir / filename
+        status = (
+            "Já no PC ✓"
+            if (
+                local_candidate.exists()
+                and (size == 0 or local_candidate.stat().st_size == size)
+            )
+            else "Disponível na Nuvem"
+        )
+        return RemoteCloudFile(
+            row_id=row_id,
+            message_id=msg.id,
+            filename=filename,
+            ext=ext,
+            size=size,
+            date_str=date_str,
+            caption=(msg.message or "").strip(),
+            status=status,
+            progress=1.0 if status == "Já no PC ✓" else 0.0,
+            message_obj=msg,
+        )
+
+    def _stream_remote_batch_to_ui(
+        self,
+        batch: List[RemoteCloudFile],
+        prepend: bool,
+        token: int,
+        entity_key: str,
+        save_checkpoint: bool = False,
+    ):
+        if token != self._remote_scan_token or not batch:
+            return
+        query = self.search_var.get().strip().lower()
+        new_items: List[RemoteCloudFile] = []
+        for rf in batch:
+            if rf.row_id in self.remote_by_id:
+                continue
+            self.remote_by_id[rf.row_id] = rf
+            self.remote_by_filename_lower[rf.filename.lower()] = rf
+            new_items.append(rf)
+
+        if not new_items:
+            return
+
+        if prepend:
+            self.remote_files = new_items + self.remote_files
+        else:
+            self.remote_files.extend(new_items)
+
+        for rf in new_items:
+            if query:
+                haystack = f"{rf.filename.lower()} {rf.ext.lower()} {rf.caption.lower()} {rf.date_str.lower()}"
+                if query not in haystack:
+                    continue
+            self._insert_dl_row(rf)
+
+        total_count = len(self.remote_files)
+        total_bytes = sum(f.size for f in self.remote_files)
+        shown = len(self.dl_tree.get_children())
+        self.cloud_summary_label.configure(
+            text=f"🔄 2º plano: {shown}/{total_count} arq. ({format_size(total_bytes)})"
+        )
+        if "download" in self.nav_buttons:
+            self.nav_buttons["download"].configure(
+                text=f"  DOWNLOAD DO TELEGRAM ({total_count})"
+            )
+
+        if save_checkpoint:
+            threading.Thread(
+                target=self._save_group_cache_entry,
+                args=(entity_key, list(self.remote_files), False),
+                daemon=True,
+            ).start()
+
+    async def _async_scan_group_files(
+        self,
+        target_entity: Union[int, str],
+        target_label: str,
+        entity_key: str,
+        token: int,
+        min_cached_id: int,
+        max_cached_id: int,
+        fully_scanned: bool,
+    ) -> bool:
+        """
+        Varredura rápida em 2º plano com filtro de servidor (InputMessagesFilterDocument)
+        e leitura incremental (lê apenas mensagens novas acima de max_cached_id, e continua
+        abaixo de min_cached_id se a primeira leitura de 60.000+ arquivos ainda não tiver terminado).
+        """
+        if not self.client.is_connected():
+            await self.client.connect()
+
+        dl_dir = Path(
+            self.config_data.get("download_dir", str(DEFAULT_DOWNLOAD_DIR))
+        )
+
+        # Fase 1: Se já tínhamos cache, busca apenas arquivos NOVOS enviados após max_cached_id
+        if max_cached_id > 0:
+            new_batch: List[RemoteCloudFile] = []
+            async for msg in self.client.iter_messages(
+                target_entity,
+                min_id=max_cached_id,
+                limit=None,
+                filter=InputMessagesFilterDocument,
+            ):
+                if token != self._remote_scan_token:
+                    return False
+                rf = self._extract_remote_file_from_msg(msg, dl_dir)
+                if rf:
+                    new_batch.append(rf)
+                    if len(new_batch) >= 150:
+                        b_copy = list(new_batch)
+                        new_batch.clear()
+                        self.after(
+                            0,
+                            lambda b=b_copy: self._stream_remote_batch_to_ui(
+                                b, True, token, entity_key, False
+                            ),
+                        )
+            if new_batch and token == self._remote_scan_token:
+                b_copy = list(new_batch)
                 self.after(
                     0,
-                    lambda c=count_now: (
-                        self.cloud_summary_label.configure(
-                            text=f"Encontrados {c} arquivos..."
-                        ),
-                        self.nav_buttons["download"].configure(
-                            text=f"  DOWNLOAD DO TELEGRAM ({c})"
-                        )
-                        if "download" in self.nav_buttons
-                        else None,
-                        self._update_scan_lock_ui(
-                            f"Lidos {c} arquivo(s) do grupo no Telegram... Aguarde terminar a leitura completa."
-                        ),
+                    lambda b=b_copy: self._stream_remote_batch_to_ui(
+                        b, True, token, entity_key, True
                     ),
                 )
 
-        return found
+        # Fase 2: Se o histórico completo do grupo ainda não foi 100% varrido, continua de onde parou (max_id)
+        if not fully_scanned and token == self._remote_scan_token:
+            older_batch: List[RemoteCloudFile] = []
+            added_since_save = 0
+            iter_kwargs = {
+                "limit": None,
+                "filter": InputMessagesFilterDocument,
+            }
+            if min_cached_id > 1:
+                iter_kwargs["max_id"] = min_cached_id - 1
+
+            async for msg in self.client.iter_messages(
+                target_entity, **iter_kwargs
+            ):
+                if token != self._remote_scan_token:
+                    return False
+                rf = self._extract_remote_file_from_msg(msg, dl_dir)
+                if rf:
+                    older_batch.append(rf)
+                    added_since_save += 1
+                    if len(older_batch) >= 200:
+                        b_copy = list(older_batch)
+                        older_batch.clear()
+                        should_save = added_since_save >= 1000
+                        if should_save:
+                            added_since_save = 0
+                        self.after(
+                            0,
+                            lambda b=b_copy, sv=should_save: self._stream_remote_batch_to_ui(
+                                b, False, token, entity_key, sv
+                            ),
+                        )
+
+            if older_batch and token == self._remote_scan_token:
+                b_copy = list(older_batch)
+                self.after(
+                    0,
+                    lambda b=b_copy: self._stream_remote_batch_to_ui(
+                        b, False, token, entity_key, False
+                    ),
+                )
+
+        return token == self._remote_scan_token
 
     def _on_scan_group_done(
         self,
-        found_files: List[RemoteCloudFile],
+        completed_full: bool,
         target_label: str,
+        entity_key: str,
         token: int,
     ):
         if token != self._remote_scan_token:
             return
         self.is_scanning_remote = False
-        self.remote_files = found_files
-        self.remote_by_id = {f.row_id: f for f in found_files}
 
         def _ui():
             self.scan_cloud_btn.configure(
                 state="normal", text="🔄 Escanear Arquivos do Grupo"
             )
-            self._apply_download_search_filter()
-            self._update_scan_lock_ui()
-            total_sz = sum(f.size for f in found_files)
-            self.current_file_label.configure(
-                text=f"Varredura concluída: {len(found_files)} arquivo(s) ({format_size(total_sz)}) disponíveis em DOWNLOAD DO TELEGRAM!"
-            )
+            self._update_dl_checked_summary()
+            total_count = len(self.remote_files)
+            total_sz = sum(f.size for f in self.remote_files)
+            if not self.is_uploading and not self.is_downloading and not self.is_scanning:
+                self.current_file_label.configure(
+                    text=f"✓ Sincronização concluída: {total_count} arquivo(s) ({format_size(total_sz)}) disponíveis em DOWNLOAD DO TELEGRAM!"
+                )
             if "download" in self.nav_buttons:
-                suffix = f" ({len(found_files)})" if len(found_files) > 0 else ""
+                suffix = f" ({total_count})" if total_count > 0 else ""
                 self.nav_buttons["download"].configure(
                     text=f"  DOWNLOAD DO TELEGRAM{suffix}"
                 )
+            if completed_full:
+                threading.Thread(
+                    target=self._save_group_cache_entry,
+                    args=(entity_key, list(self.remote_files), True),
+                    daemon=True,
+                ).start()
 
         self.after(0, _ui)
         self.log(
-            f"✓ {len(found_files)} arquivo(s) encontrados no grupo '{target_label}'."
+            f"✓ Sincronização em 2º plano concluída: {len(self.remote_files)} arquivo(s) disponíveis no grupo '{target_label}'."
         )
 
     def _on_scan_group_error(self, exc: Exception):
@@ -3734,30 +3979,50 @@ del "%~f0" >nul 2>&1
                 self.scan_cloud_btn.configure(
                     state="normal", text="🔄 Escanear Arquivos do Grupo"
                 ),
-                self._update_scan_lock_ui(),
             ),
         )
-        self.log(f"Aviso ao escanear grupo: {exc}")
+        self.log(f"Aviso ao sincronizar grupo em 2º plano: {exc}")
 
     def _apply_download_search_filter(self):
+        self._dl_filter_render_token += 1
+        render_token = self._dl_filter_render_token
         query = self.search_var.get().strip().lower()
         for iid in self.dl_tree.get_children():
             self.dl_tree.delete(iid)
 
-        shown = 0
+        matching: List[RemoteCloudFile] = []
         total_bytes = 0
         for item in self.remote_files:
             if query:
                 haystack = f"{item.filename.lower()} {item.ext.lower()} {item.caption.lower()} {item.date_str.lower()}"
                 if query not in haystack:
                     continue
-            self._insert_dl_row(item)
-            shown += 1
+            matching.append(item)
             total_bytes += item.size
 
         self.cloud_summary_label.configure(
-            text=f"{shown} de {len(self.remote_files)} arq. ({format_size(total_bytes)})"
+            text=f"{len(matching)} de {len(self.remote_files)} arq. ({format_size(total_bytes)})"
         )
+        self._render_dl_rows_chunked(matching, 0, render_token)
+
+    def _render_dl_rows_chunked(
+        self, items: List[RemoteCloudFile], start_idx: int, render_token: int
+    ):
+        if render_token != self._dl_filter_render_token:
+            return
+        CHUNK = 400
+        end_idx = min(start_idx + CHUNK, len(items))
+        for i in range(start_idx, end_idx):
+            rf = items[i]
+            if not self.dl_tree.exists(rf.row_id):
+                self._insert_dl_row(rf)
+        if end_idx < len(items):
+            self.after(
+                4,
+                lambda: self._render_dl_rows_chunked(
+                    items, end_idx, render_token
+                ),
+            )
 
     def _insert_dl_row(self, item: RemoteCloudFile):
         chk_str = "☑" if item.checked else "☐"
@@ -3910,17 +4175,25 @@ del "%~f0" >nul 2>&1
             self.remote_files = [
                 f for f in self.remote_files if f.row_id in self.remote_by_id
             ]
+            self.remote_by_filename_lower = {
+                f.filename.lower(): f for f in self.remote_files
+            }
             self._update_dl_checked_summary()
             if "download" in self.nav_buttons:
                 suffix = f" ({len(self.remote_files)})" if self.remote_files else ""
                 self.nav_buttons["download"].configure(
                     text=f"  DOWNLOAD DO TELEGRAM{suffix}"
                 )
+            target_entity = self.dialogs_map.get(target_label, "me")
+            threading.Thread(
+                target=self._save_group_cache_entry,
+                args=(str(target_entity), list(self.remote_files), True),
+                daemon=True,
+            ).start()
             self.log(
                 f"🗑 Removendo {removed} arquivo(s) da lista e apagando do grupo '{target_label}' no Telegram..."
             )
             if msg_ids and self.connected_mode == "personal" and self.client:
-                target_entity = self.dialogs_map.get(target_label, "me")
                 self.worker.run_coro(
                     self._async_delete_messages_from_group(
                         target_entity, target_label, msg_ids
@@ -4039,7 +4312,7 @@ del "%~f0" >nul 2>&1
         )
 
     def toggle_pause_download(self):
-        if self.is_scanning or self.is_scanning_remote:
+        if self.is_scanning:
             return
         if not self.is_download_paused and self.is_downloading:
             self.is_download_paused = True
@@ -4222,6 +4495,17 @@ del "%~f0" >nul 2>&1
                     try:
                         if not self.client.is_connected():
                             await self.client.connect()
+
+                        if item.message_obj is None:
+                            target_label = self.target_combo.get()
+                            target_entity = self.dialogs_map.get(target_label, "me")
+                            item.message_obj = await self.client.get_messages(
+                                target_entity, ids=item.message_id
+                            )
+                            if item.message_obj is None:
+                                raise RuntimeError(
+                                    f"Mensagem #{item.message_id} não encontrada no grupo do Telegram."
+                                )
 
                         await self.client.download_media(
                             item.message_obj,
@@ -4977,7 +5261,7 @@ del "%~f0" >nul 2>&1
     # Execução do Upload Automático com Botão Único INICIAR (Verde) / PAUSAR (Amarelo)
     # -------------------------------------------------------------------------
     def start_upload_queue(self):
-        if self.is_scanning or self.is_scanning_remote:
+        if self.is_scanning:
             return
 
         if self.is_paused:
@@ -5045,7 +5329,7 @@ del "%~f0" >nul 2>&1
         )
 
     def toggle_pause_upload(self):
-        if self.is_scanning or self.is_scanning_remote:
+        if self.is_scanning:
             return
         if not self.is_paused and self.is_uploading:
             self.is_paused = True
@@ -5082,11 +5366,11 @@ del "%~f0" >nul 2>&1
         self._update_scan_lock_ui()
 
     def _file_exists_in_download_scan(self, item: FileQueueItem) -> Optional[str]:
-        """Verifica se o arquivo já consta na varredura de Downloads do grupo ou no histórico enviado."""
+        """Verifica instantaneamente (O(1)) se o arquivo já consta na varredura de Downloads do grupo ou no histórico enviado."""
         fname_lower = item.path.name.lower()
-        for rf in list(self.remote_files):
-            if rf.filename.lower() == fname_lower:
-                return f"Lista de Downloads do Grupo ({rf.date_str} • {format_size(rf.size)})"
+        rf = self.remote_by_filename_lower.get(fname_lower)
+        if rf is not None:
+            return f"Lista de Downloads do Grupo ({rf.date_str} • {format_size(rf.size)})"
         sig = make_file_signature(item.path, item.size)
         prev = self.sent_signatures.get(sig)
         if prev:
