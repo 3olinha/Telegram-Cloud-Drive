@@ -22,6 +22,7 @@ FILE_TYPE_FILTER_OPTIONS = [
     "Vídeos (.mp4, .mkv, .avi, .mov)",
     "Áudios (.mp3, .wav, .ogg)",
     "Compactados (.zip, .rar, .7z)",
+    "Impressão 3D (.stl)",
     "Programas (.exe, .msi, .apk)",
     "Outros",
 ]
@@ -40,6 +41,7 @@ _EXT_TO_CATEGORY = {
     ".aac": "audio", ".m4a": "audio", ".wma": "audio", ".opus": "audio",
     ".zip": "archive", ".rar": "archive", ".7z": "archive", ".tar": "archive",
     ".gz": "archive", ".bz2": "archive", ".iso": "archive",
+    ".stl": "stl",
     ".exe": "exe", ".msi": "exe", ".bat": "exe", ".cmd": "exe", ".apk": "exe", ".appx": "exe",
 }
 
@@ -53,6 +55,7 @@ FILTER_LABEL_TO_CATEGORY = {
     "Vídeos (.mp4, .mkv, .avi, .mov)": "video",
     "Áudios (.mp3, .wav, .ogg)": "audio",
     "Compactados (.zip, .rar, .7z)": "archive",
+    "Impressão 3D (.stl)": "stl",
     "Programas (.exe, .msi, .apk)": "exe",
     "Outros": "other",
 }
@@ -140,6 +143,7 @@ def create_file_type_icons() -> Dict[str, ImageTk.PhotoImage]:
         "video": _base_doc((124, 58, 237, 255), draw_fn=_draw_video),
         "audio": _base_doc((6, 182, 212, 255), draw_fn=_draw_audio),
         "archive": _base_doc((217, 119, 6, 255), draw_fn=_draw_archive),
+        "stl": _base_doc((13, 148, 136, 255), "STL"),
         "exe": _base_doc((37, 99, 235, 255), draw_fn=_draw_exe),
         "other": _base_doc((100, 116, 139, 255), draw_fn=_draw_other),
     }
