@@ -230,10 +230,159 @@ del "%~f0" >nul 2>&1
 class GitHubUpdaterMixin:
     """Mixin com a lógica de verificação, download e aplicação de atualizações via GitHub Releases."""
 
-    def check_for_updates(self, silent_if_up_to_date: bool = True):
+    def start_periodic_update_checks(self, interval_ms: int = 1800000):
+        """
+        Agenda verificações periódicas ultraleves de atualização em segundo plano (padrão: a cada 30 minutos).
+        Usa uma única requisição HTTP pequena em thread separada — zero impacto em uploads/downloads.
+        """
+        def _tick():
+            try:
+                if self.winfo_exists():
+                    self.check_for_updates(
+                        silent_if_up_to_date=True, background_toast=True
+                    )
+                    self.after(interval_ms, _tick)
+            except Exception:
+                pass
+
+        self.after(interval_ms, _tick)
+
+    def on_update_button_clicked(self):
+        """Ação do botão '🔄 Atualizar' no topo: para o alerta visual e abre o modal de atualização."""
+        self._stop_update_btn_pulse()
+        self._dismiss_update_toast()
+        pending = getattr(self, "_pending_update_info", None)
+        if pending:
+            remote_ver, release_title, release_notes, exe_url, exe_size = pending
+            self._show_update_available_dialog(
+                remote_ver, release_title, release_notes, exe_url, exe_size
+            )
+        else:
+            self.check_for_updates(silent_if_up_to_date=False, background_toast=False)
+
+    def _start_update_btn_pulse(self):
+        """Faz o botão '🔄 Atualizar' no topo piscar de forma suave até o usuário clicar nele."""
+        if getattr(self, "_update_pulse_active", False):
+            return
+        self._update_pulse_active = True
+        self._update_pulse_step = 0
+
+        def _pulse():
+            if not getattr(self, "_update_pulse_active", False):
+                return
+            try:
+                if not self.winfo_exists() or not hasattr(self, "update_top_btn"):
+                    self._update_pulse_active = False
+                    return
+                self._update_pulse_step = (self._update_pulse_step + 1) % 2
+                if self._update_pulse_step == 1:
+                    self.update_top_btn.configure(
+                        fg_color="#10b981",
+                        border_width=2,
+                        border_color="#fde047",
+                        text="🔔 Nova Versão!",
+                    )
+                else:
+                    self.update_top_btn.configure(
+                        fg_color="#047857",
+                        border_width=2,
+                        border_color="#86efac",
+                        text="🔄 Atualizar",
+                    )
+                self.after(750, _pulse)
+            except Exception:
+                self._update_pulse_active = False
+
+        _pulse()
+
+    def _stop_update_btn_pulse(self):
+        """Interrompe o pulso suave do botão Atualizar e restaura o visual padrão."""
+        self._update_pulse_active = False
+        try:
+            if hasattr(self, "update_top_btn") and self.update_top_btn.winfo_exists():
+                self.update_top_btn.configure(
+                    fg_color="#059669",
+                    border_width=0,
+                    text="🔄 Atualizar",
+                )
+        except Exception:
+            pass
+
+    def _dismiss_update_toast(self):
+        """Fecha o balão flutuante de aviso de nova versão, se estiver visível."""
+        toast = getattr(self, "_update_toast_frame", None)
+        if toast is not None:
+            try:
+                if toast.winfo_exists():
+                    toast.place_forget()
+                    toast.destroy()
+            except Exception:
+                pass
+            self._update_toast_frame = None
+
+    def _show_update_toast_banner(self, remote_ver: str):
+        """
+        Exibe um balão flutuante discreto no canto superior direito avisando sobre a nova versão.
+        Desaparece automaticamente após 30 segundos sem interromper uploads/downloads.
+        """
+        self._dismiss_update_toast()
+        try:
+            toast = ctk.CTkFrame(
+                self,
+                fg_color="#064e3b",
+                border_width=2,
+                border_color="#34d399",
+                corner_radius=10,
+            )
+            self._update_toast_frame = toast
+
+            ctk.CTkLabel(
+                toast,
+                text=f"🚀 Nova versão disponível: v{remote_ver}!",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color="#fef08a",
+                anchor="w",
+            ).grid(row=0, column=0, padx=(12, 8), pady=(8, 2), sticky="w")
+
+            ctk.CTkButton(
+                toast,
+                text="✕",
+                width=24,
+                height=24,
+                fg_color="transparent",
+                hover_color="#065f46",
+                text_color="#d1fae5",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=self._dismiss_update_toast,
+            ).grid(row=0, column=1, padx=(0, 8), pady=(6, 0), sticky="ne")
+
+            ctk.CTkLabel(
+                toast,
+                text=(
+                    "Clique no botão '🔄 Atualizar' no topo quando quiser atualizar.\n"
+                    "(Este aviso desaparecerá automaticamente em 30 segundos.)"
+                ),
+                font=ctk.CTkFont(size=11),
+                text_color="#ecfdf5",
+                justify="left",
+                anchor="w",
+            ).grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+
+            toast.place(relx=0.985, y=58, anchor="ne")
+            toast.lift()
+
+            # Some automaticamente após 30 segundos
+            self.after(30000, self._dismiss_update_toast)
+        except Exception:
+            pass
+
+    def check_for_updates(
+        self, silent_if_up_to_date: bool = True, background_toast: bool = False
+    ):
         """
         Consulta a última Release publicada no GitHub (3olinha/Telegram-Cloud-Drive).
-        Se existir uma versão mais nova que APP_VERSION, abre o modal perguntando ao usuário se deseja atualizar.
+        - Se `background_toast=True` (durante o uso): exibe balão de 30s + botão Atualizar piscando suave.
+        - Se `background_toast=False` (manual ou inicialização): abre o modal perguntando se deseja atualizar.
         """
         if getattr(self, "_is_checking_updates", False):
             return
@@ -277,13 +426,33 @@ class GitHubUpdaterMixin:
                         break
 
                 if remote_tuple > local_tuple and exe_url:
-                    self.log(f"🚀 Nova atualização detectada no GitHub: v{remote_ver} (atual: v{APP_VERSION}).")
-                    self.after(
-                        0,
-                        lambda: self._show_update_available_dialog(
-                            remote_ver, release_title, release_notes, exe_url, exe_size
-                        ),
+                    self._pending_update_info = (
+                        remote_ver,
+                        release_title,
+                        release_notes,
+                        exe_url,
+                        exe_size,
                     )
+                    last_notified = getattr(self, "_last_toast_notified_ver", "")
+                    if background_toast:
+                        if last_notified != remote_ver:
+                            self._last_toast_notified_ver = remote_ver
+                            self.log(
+                                f"🚀 Nova atualização detectada em segundo plano: v{remote_ver} (atual: v{APP_VERSION})."
+                            )
+                            self.after(0, lambda v=remote_ver: self._show_update_toast_banner(v))
+                        self.after(0, self._start_update_btn_pulse)
+                    else:
+                        self.log(
+                            f"🚀 Nova atualização detectada no GitHub: v{remote_ver} (atual: v{APP_VERSION})."
+                        )
+                        self.after(0, self._start_update_btn_pulse)
+                        self.after(
+                            0,
+                            lambda: self._show_update_available_dialog(
+                                remote_ver, release_title, release_notes, exe_url, exe_size
+                            ),
+                        )
                 else:
                     if not silent_if_up_to_date:
                         self.after(
