@@ -31,6 +31,8 @@ from storage.paths import (
     APP_VERSION,
     APP_TITLE,
     APP_SUBTITLE,
+    DONATE_URL_PIX,
+    DONATE_URL_GLOBAL,
     BUNDLE_DIR,
     EXE_DIR,
     USER_DATA_DIR,
@@ -57,6 +59,7 @@ from telegram_core.models_and_errors import (
     FileQueueItem,
     RemoteCloudFile,
     format_size,
+    format_eta,
     make_file_signature,
 )
 from telegram_core.engine import TelegramTransferEngineMixin
@@ -187,6 +190,8 @@ class TelegramUploaderApp(
         super().after(
             2200, lambda: self.check_for_updates(silent_if_up_to_date=True)
         )
+        # Checagem periódica leve em 2º plano durante o uso (a cada 30 min -> balão de 30s + botão piscante)
+        super().after(5000, lambda: self.start_periodic_update_checks(1800000))
 
     def _deferred_startup_restore(self):
         """Carrega histórico (500 mais recentes), logs e fila salva após a janela já estar visível na aba Upload."""
@@ -924,36 +929,50 @@ class TelegramUploaderApp(
 
         ctk.CTkButton(
             opt_btn_row,
-            text="📖 Ver Instruções de Uso",
-            width=185,
+            text="📖 Instruções de Uso",
+            width=155,
             height=34,
             fg_color="#0284c7",
             hover_color="#0369a1",
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.show_welcome_guide,
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
 
         ctk.CTkButton(
             opt_btn_row,
-            text="🔄 Verificar Atualizações",
-            width=180,
+            text="🔄 Atualizações",
+            width=140,
             height=34,
             fg_color="#2563eb",
             hover_color="#1d4ed8",
             font=ctk.CTkFont(size=12, weight="bold"),
             command=lambda: self.check_for_updates(silent_if_up_to_date=False),
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            opt_btn_row,
+            text="☕ Apoiar o Projeto",
+            width=150,
+            height=34,
+            fg_color="#334155",
+            hover_color="#475569",
+            border_width=1,
+            border_color="#f59e0b",
+            text_color="#fde68a",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.open_donate_window,
+        ).pack(side="left", padx=4)
 
         ctk.CTkButton(
             opt_btn_row,
             text="✓ Fechar e Salvar",
-            width=150,
+            width=140,
             height=34,
             fg_color="#16a34a",
             hover_color="#15803d",
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.options_win.destroy,
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
 
         uninstall_row = ctk.CTkFrame(tab_general, fg_color="transparent")
         uninstall_row.pack(pady=(2, 8))
@@ -1160,16 +1179,17 @@ class TelegramUploaderApp(
         top_right_btns = ctk.CTkFrame(brand_frame, fg_color="transparent")
         top_right_btns.grid(row=0, column=1, padx=10, pady=6, sticky="e")
 
-        ctk.CTkButton(
+        self.update_top_btn = ctk.CTkButton(
             top_right_btns,
             text="🔄 Atualizar",
-            width=92,
+            width=102,
             height=26,
             fg_color="#059669",
             hover_color="#047857",
             font=ctk.CTkFont(size=11, weight="bold"),
-            command=lambda: self.check_for_updates(silent_if_up_to_date=False),
-        ).pack(side="left", padx=(0, 6))
+            command=self.on_update_button_clicked,
+        )
+        self.update_top_btn.pack(side="left", padx=(0, 6))
 
         ctk.CTkButton(
             top_right_btns,
@@ -1383,23 +1403,71 @@ class TelegramUploaderApp(
         )
         self.speed_label.grid(row=0, column=1, sticky="e")
 
-        self.file_progress_title_label = ctk.CTkLabel(
+        # Barra Amarela de Atenção para Limite do Telegram (FloodWaitError) — oculta até ser necessária
+        self.flood_wait_banner = ctk.CTkFrame(
             bottom_frame,
-            text="Progresso do Arquivo Atual:   •   Tempo previsto para conclusão: --",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#cbd5e1",
+            fg_color="#78350f",
+            border_width=2,
+            border_color="#f59e0b",
+            corner_radius=8,
         )
-        self.file_progress_title_label.grid(
-            row=1, column=0, padx=12, sticky="w"
+        self.flood_wait_banner.grid(
+            row=1, column=0, padx=12, pady=(4, 4), sticky="ew"
+        )
+        self.flood_wait_banner.grid_columnconfigure(0, weight=1)
+
+        self.flood_wait_title_label = ctk.CTkLabel(
+            self.flood_wait_banner,
+            text="⚠️ Atenção: Limite de envio do Telegram atingido!",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#fde047",
+            anchor="w",
+        )
+        self.flood_wait_title_label.grid(
+            row=0, column=0, padx=12, pady=(6, 1), sticky="ew"
         )
 
-        self.file_progress_bar = LabeledProgressBar(
-            bottom_frame, height=20, progress_color="#2563eb"
+        self.flood_wait_desc_label = ctk.CTkLabel(
+            self.flood_wait_banner,
+            text=(
+                "Isso é totalmente normal: o Telegram limita envios muito rápidos em sequência para proteger contra spam e manter os servidores estáveis. "
+                "Você não precisa fazer nada — o programa continuará o envio automaticamente assim que o tempo acima zerar."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color="#fef3c7",
+            justify="left",
+            anchor="w",
+            wraplength=980,
         )
-        self.file_progress_bar.grid(
-            row=2, column=0, padx=12, pady=(1, 4), sticky="ew"
+        self.flood_wait_desc_label.grid(
+            row=1, column=0, padx=12, pady=(0, 6), sticky="ew"
         )
-        self.file_progress_bar.set(0)
+        self.flood_wait_banner.grid_remove()
+
+        # Barra de Progresso de Varredura do Grupo (aba Download) — exibida durante a sincronização do Telegram com % e ETA
+        self.scan_progress_frame = ctk.CTkFrame(
+            bottom_frame, fg_color="transparent"
+        )
+        self.scan_progress_frame.grid(
+            row=2, column=0, padx=12, pady=(2, 4), sticky="ew"
+        )
+        self.scan_progress_frame.grid_columnconfigure(0, weight=1)
+
+        self.scan_progress_title_label = ctk.CTkLabel(
+            self.scan_progress_frame,
+            text="🔍 Varredura do Grupo no Telegram: 0.0%   •   Tempo estimado: calculando...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#38bdf8",
+            anchor="w",
+        )
+        self.scan_progress_title_label.grid(row=0, column=0, sticky="w")
+
+        self.scan_progress_bar = LabeledProgressBar(
+            self.scan_progress_frame, height=20, progress_color="#0284c7"
+        )
+        self.scan_progress_bar.grid(row=1, column=0, pady=(2, 2), sticky="ew")
+        self.scan_progress_bar.set(0)
+        self.scan_progress_frame.grid_remove()
 
         self.total_progress_title_label = ctk.CTkLabel(
             bottom_frame,
@@ -1412,10 +1480,10 @@ class TelegramUploaderApp(
         )
 
         self.total_progress_bar = LabeledProgressBar(
-            bottom_frame, height=20, progress_color="#10b981"
+            bottom_frame, height=22, progress_color="#10b981"
         )
         self.total_progress_bar.grid(
-            row=4, column=0, padx=12, pady=(1, 6), sticky="ew"
+            row=4, column=0, padx=12, pady=(2, 6), sticky="ew"
         )
         self.total_progress_bar.set(0)
 
@@ -1427,12 +1495,201 @@ class TelegramUploaderApp(
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#38bdf8",
         ).pack(side="right", padx=6)
+        ctk.CTkButton(
+            credits_bar,
+            text="☕ Apoiar o Projeto",
+            width=136,
+            height=24,
+            corner_radius=12,
+            fg_color="#1e293b",
+            hover_color="#334155",
+            border_width=1,
+            border_color="#475569",
+            text_color="#fde68a",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.open_donate_window,
+        ).pack(side="right", padx=(6, 10))
         ctk.CTkLabel(
             credits_bar,
             text=f"{APP_TITLE} — {APP_SUBTITLE}",
             font=ctk.CTkFont(size=11),
             text_color="#64748b",
         ).pack(side="left", padx=6)
+
+    def open_donate_window(self):
+        """Abre uma janela simples e amigável para apoio opcional ao projeto (sem expor dados pessoais)."""
+        if (
+            hasattr(self, "donate_win")
+            and self.donate_win is not None
+            and self.donate_win.winfo_exists()
+        ):
+            self.donate_win.lift()
+            self.donate_win.focus_force()
+            return
+
+        self.donate_win = ctk.CTkToplevel(self)
+        self.donate_win.title(f"Apoiar o Projeto — {APP_TITLE}")
+        self.donate_win.geometry("500x300")
+        self.donate_win.resizable(False, False)
+        self.donate_win.transient(self)
+        self._apply_window_icon(self.donate_win)
+
+        def _open_and_close(url: str):
+            try:
+                if (
+                    hasattr(self, "options_win")
+                    and self.options_win is not None
+                    and self.options_win.winfo_exists()
+                ):
+                    self.options_win.attributes("-topmost", False)
+            except Exception:
+                pass
+            try:
+                if self.donate_win is not None and self.donate_win.winfo_exists():
+                    self.donate_win.destroy()
+            except Exception:
+                pass
+            webbrowser.open(url)
+
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 250
+        y = self.winfo_y() + (self.winfo_height() // 2) - 150
+        self.donate_win.geometry(f"500x300+{max(x, 40)}+{max(y, 40)}")
+
+        card = ctk.CTkFrame(
+            self.donate_win,
+            fg_color="#17212b",
+            corner_radius=12,
+            border_width=1,
+            border_color="#334155",
+        )
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(
+            card,
+            text="☕ Apoiar o Telegram Cloud Drive",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color="#fde68a",
+        ).pack(pady=(16, 8))
+
+        ctk.CTkLabel(
+            card,
+            text=(
+                "O Telegram Cloud Drive é 100% gratuito e de código aberto.\n"
+                "Se a ferramenta facilita seu dia a dia, você pode apoiar\n"
+                "de forma totalmente opcional para ajudar na evolução,\n"
+                "correções e novos recursos do projeto."
+            ),
+            font=ctk.CTkFont(size=12),
+            text_color="#cbd5e1",
+            justify="center",
+        ).pack(padx=20, pady=(0, 16))
+
+        ctk.CTkButton(
+            card,
+            text="🇧🇷 Apoiar via Pix (LivePix)",
+            width=290,
+            height=38,
+            corner_radius=8,
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: _open_and_close(DONATE_URL_PIX),
+        ).pack(pady=(0, 10))
+
+        ctk.CTkButton(
+            card,
+            text="🌎 Apoiar via GitHub Sponsors",
+            width=290,
+            height=38,
+            corner_radius=8,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: _open_and_close(DONATE_URL_GLOBAL),
+        ).pack(pady=(0, 14))
+
+        ctk.CTkButton(
+            card,
+            text="Fechar",
+            width=110,
+            height=28,
+            fg_color="#334155",
+            hover_color="#475569",
+            font=ctk.CTkFont(size=11),
+            command=self.donate_win.destroy,
+        ).pack(pady=(0, 8))
+
+    def _update_footer_transfer_status(
+        self,
+        kind: str,
+        current_text: Optional[str] = None,
+        overall_frac: Optional[float] = None,
+        bar_text: Optional[str] = None,
+        title_text: Optional[str] = None,
+        speed_text: Optional[str] = None,
+    ):
+        """Mantém snapshots independentes de Upload e Download no rodapé para permitir operações simultâneas."""
+        if not hasattr(self, "_footer_transfer_state"):
+            self._footer_transfer_state = {"upload": {}, "download": {}}
+        snap = self._footer_transfer_state.setdefault(kind, {})
+        if current_text is not None:
+            snap["current_text"] = current_text
+        if overall_frac is not None:
+            snap["overall_frac"] = overall_frac
+        if bar_text is not None:
+            snap["bar_text"] = bar_text
+        if title_text is not None:
+            snap["title_text"] = title_text
+        if speed_text is not None:
+            snap["speed_text"] = speed_text
+
+        both_active = bool(self.is_uploading and self.is_downloading)
+        active_page = getattr(self, "active_page_key", "upload")
+        if both_active:
+            if active_page == "download" and kind != "download":
+                return
+            if active_page != "download" and kind != "upload":
+                return
+
+        self._apply_footer_snapshot(snap)
+
+    def _apply_footer_snapshot(self, snap: dict):
+        if not snap:
+            return
+        if "current_text" in snap and hasattr(self, "current_file_label"):
+            self.current_file_label.configure(text=snap["current_text"])
+        if "overall_frac" in snap and hasattr(self, "total_progress_bar"):
+            self.total_progress_bar.set(
+                snap["overall_frac"], snap.get("bar_text", "")
+            )
+        if "title_text" in snap and hasattr(self, "total_progress_title_label"):
+            self.total_progress_title_label.configure(text=snap["title_text"])
+        if "speed_text" in snap and hasattr(self, "speed_label"):
+            self.speed_label.configure(text=snap["speed_text"])
+
+    def _refresh_footer_for_active_page(self):
+        if not hasattr(self, "_footer_transfer_state"):
+            return
+        active_page = getattr(self, "active_page_key", "upload")
+        if active_page == "download" and self.is_downloading:
+            self._apply_footer_snapshot(
+                self._footer_transfer_state.get("download", {})
+            )
+        elif active_page == "upload" and self.is_uploading:
+            self._apply_footer_snapshot(
+                self._footer_transfer_state.get("upload", {})
+            )
+        elif self.is_uploading:
+            self._apply_footer_snapshot(
+                self._footer_transfer_state.get("upload", {})
+            )
+        elif self.is_downloading:
+            self._apply_footer_snapshot(
+                self._footer_transfer_state.get("download", {})
+            )
 
     def switch_page(self, page_key: str):
         """Alterna entre as 4 seções principais destacando o botão retangular ativo."""
@@ -1463,6 +1720,7 @@ class TelegramUploaderApp(
                     border_width=1,
                     text_color="#cbd5e1",
                 )
+        self._refresh_footer_for_active_page()
 
     def _update_scan_lock_ui(self, detail_msg: str = ""):
         """
@@ -1695,10 +1953,11 @@ class TelegramUploaderApp(
         columns = (
             "check",
             "name",
+            "progress",
+            "eta",
+            "status",
             "folder",
             "size",
-            "status",
-            "progress",
             "sent_at",
         )
         self.tree = ttk.Treeview(
@@ -1716,19 +1975,21 @@ class TelegramUploaderApp(
             command=self.toggle_all_upload_checkboxes,
         )
         self.tree.heading("name", text="Arquivo", anchor="w")
+        self.tree.heading("progress", text="Progresso", anchor="center")
+        self.tree.heading("eta", text="Tempo Previsto", anchor="center")
+        self.tree.heading("status", text="Status", anchor="center")
         self.tree.heading("folder", text="Pasta de Origem", anchor="w")
         self.tree.heading("size", text="Tamanho", anchor="e")
-        self.tree.heading("status", text="Status", anchor="center")
-        self.tree.heading("progress", text="Progresso", anchor="e")
         self.tree.heading("sent_at", text="Enviado em", anchor="center")
 
-        self.tree.column("check", width=50, anchor="center", stretch=False)
-        self.tree.column("name", width=260, anchor="w", stretch=True)
-        self.tree.column("folder", width=210, anchor="w", stretch=True)
-        self.tree.column("size", width=90, anchor="e", stretch=False)
-        self.tree.column("status", width=140, anchor="center", stretch=False)
-        self.tree.column("progress", width=85, anchor="e", stretch=False)
-        self.tree.column("sent_at", width=135, anchor="center", stretch=False)
+        self.tree.column("check", width=44, anchor="center", stretch=False)
+        self.tree.column("name", width=250, anchor="w", stretch=True)
+        self.tree.column("progress", width=130, anchor="center", stretch=False)
+        self.tree.column("eta", width=115, anchor="center", stretch=False)
+        self.tree.column("status", width=135, anchor="center", stretch=False)
+        self.tree.column("folder", width=190, anchor="w", stretch=True)
+        self.tree.column("size", width=85, anchor="e", stretch=False)
+        self.tree.column("sent_at", width=130, anchor="center", stretch=False)
 
         self.tree.tag_configure("Pendente", foreground="#e2e8f0")
         self.tree.tag_configure("Marcado", foreground="#38bdf8")
@@ -1955,9 +2216,10 @@ class TelegramUploaderApp(
             "filename",
             "ext",
             "size",
-            "date",
-            "status",
             "progress",
+            "eta",
+            "status",
+            "date",
         )
         self.dl_tree = ttk.Treeview(
             dl_table_container,
@@ -1978,18 +2240,20 @@ class TelegramUploaderApp(
         )
         self.dl_tree.heading("ext", text="Tipo", anchor="center")
         self.dl_tree.heading("size", text="Tamanho", anchor="e")
-        self.dl_tree.heading("date", text="Data no Telegram", anchor="center")
+        self.dl_tree.heading("progress", text="Progresso", anchor="center")
+        self.dl_tree.heading("eta", text="Tempo Previsto", anchor="center")
         self.dl_tree.heading("status", text="Status", anchor="center")
-        self.dl_tree.heading("progress", text="Download", anchor="e")
+        self.dl_tree.heading("date", text="Data no Telegram", anchor="center")
 
         self.dl_tree.column("#0", width=36, minwidth=36, anchor="center", stretch=False)
-        self.dl_tree.column("check", width=44, anchor="center", stretch=False)
-        self.dl_tree.column("filename", width=340, anchor="w", stretch=True)
-        self.dl_tree.column("ext", width=80, anchor="center", stretch=False)
-        self.dl_tree.column("size", width=100, anchor="e", stretch=False)
-        self.dl_tree.column("date", width=140, anchor="center", stretch=False)
-        self.dl_tree.column("status", width=165, anchor="center", stretch=False)
-        self.dl_tree.column("progress", width=90, anchor="e", stretch=False)
+        self.dl_tree.column("check", width=42, anchor="center", stretch=False)
+        self.dl_tree.column("filename", width=310, anchor="w", stretch=True)
+        self.dl_tree.column("ext", width=70, anchor="center", stretch=False)
+        self.dl_tree.column("size", width=90, anchor="e", stretch=False)
+        self.dl_tree.column("progress", width=130, anchor="center", stretch=False)
+        self.dl_tree.column("eta", width=115, anchor="center", stretch=False)
+        self.dl_tree.column("status", width=155, anchor="center", stretch=False)
+        self.dl_tree.column("date", width=135, anchor="center", stretch=False)
 
         self.dl_tree.tag_configure("Disponível na Nuvem", foreground="#e2e8f0")
         self.dl_tree.tag_configure("Marcado", foreground="#38bdf8")
@@ -2914,8 +3178,9 @@ class TelegramUploaderApp(
         self.is_scanning_remote = False
 
         def _ui():
+            self._hide_scan_progress()
             self.scan_cloud_btn.configure(
-                state="normal", text="🔄 Escanear Arquivos do Grupo"
+                state="normal", text="🔄 Escanear Grupo"
             )
             self._update_dl_pagination_controls()
             self._update_dl_checked_summary()
@@ -2948,15 +3213,95 @@ class TelegramUploaderApp(
 
     def _on_scan_group_error(self, exc: Exception):
         self.is_scanning_remote = False
+        self._hide_scan_progress()
         self.after(
             0,
             lambda: (
                 self.scan_cloud_btn.configure(
-                    state="normal", text="🔄 Escanear Arquivos do Grupo"
+                    state="normal", text="🔄 Escanear Grupo"
                 ),
             ),
         )
         self.log(f"Aviso ao sincronizar grupo em 2º plano: {exc}")
+
+    def _on_uploaded_file_sync_download_tab(
+        self, item: FileQueueItem, sent_msg, target_label: str
+    ):
+        """
+        Sincroniza em tempo real cada arquivo recém-enviado na aba DOWNLOAD DO TELEGRAM:
+        - Atualiza o contador total da aba e o resumo Total: X/Y;
+        - Quando 'Todos os Tipos' estiver marcado e nenhum download estiver ativo,
+          exibe e faz Auto-Scroll automaticamente para o último arquivo subido.
+        """
+        def _sync():
+            try:
+                if target_label != self.target_combo.get():
+                    return
+                msg_id = int(getattr(sent_msg, "id", 0) or 0)
+                row_id = (
+                    f"msg_{msg_id}"
+                    if msg_id > 0
+                    else f"up_{int(time.time() * 1000)}_{item.item_id}"
+                )
+                if row_id in self.remote_by_id:
+                    return
+
+                ext = (item.path.suffix.lower() or "arquivo")
+                rf = RemoteCloudFile(
+                    row_id=row_id,
+                    message_id=msg_id,
+                    filename=item.path.name,
+                    ext=ext,
+                    size=max(int(item.size or 0), 0),
+                    date_str=datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    caption="",
+                    status="Disponível na Nuvem",
+                    progress=0.0,
+                    checked=False,
+                    message_obj=sent_msg,
+                    sha256=getattr(item, "sha256", "") or "",
+                )
+                self.remote_files.insert(0, rf)
+                self.remote_by_id[rf.row_id] = rf
+
+                total_count = len(self.remote_files)
+                if "download" in self.nav_buttons:
+                    self.nav_buttons["download"].configure(
+                        text=f"  DOWNLOAD DO TELEGRAM ({total_count})"
+                    )
+
+                cat_filter = getattr(self, "dl_type_filter", "all")
+                query = self.search_var.get().strip().lower()
+                matches_filter = (
+                    cat_filter == "all"
+                    or get_file_category(rf.ext) == cat_filter
+                ) and (
+                    not query
+                    or query in f"{rf.filename.lower()} {rf.ext.lower()} {rf.date_str.lower()}"
+                )
+
+                if matches_filter:
+                    self.dl_filtered_files.insert(0, rf)
+                    if (
+                        cat_filter == "all"
+                        and not query
+                        and not self.is_downloading
+                        and not self.is_download_paused
+                    ):
+                        self.dl_page_index = 0
+                        self._render_current_dl_page()
+                        if self.dl_tree.exists(rf.row_id):
+                            self.dl_tree.see(rf.row_id)
+                            self.dl_tree.selection_set(rf.row_id)
+                    elif self.dl_page_index == 0 and not self.is_downloading:
+                        self._render_current_dl_page()
+
+                self._update_dl_pagination_controls()
+                self._update_dl_checked_summary()
+            except Exception:
+                pass
+
+        self.after(0, _sync)
 
     def _on_dl_type_filter_changed(self, selected_label: str):
         self.dl_type_filter = FILTER_LABEL_TO_CATEGORY.get(selected_label, "all")
@@ -3040,7 +3385,9 @@ class TelegramUploaderApp(
 
     def _insert_dl_row(self, item: RemoteCloudFile):
         chk_str = "☑" if item.checked else "☐"
-        pct = "100%" if "✓" in item.status else f"{item.progress * 100:0.0f}%"
+        is_done = "✓" in item.status
+        pct = self._format_inline_progress(1.0 if is_done else item.progress)
+        eta_val = "Concluído" if is_done else "-"
         tag = (
             "Marcado"
             if item.checked and item.status == "Disponível na Nuvem"
@@ -3059,9 +3406,10 @@ class TelegramUploaderApp(
                 item.filename,
                 item.ext,
                 format_size(item.size) if item.size > 0 else "-",
-                item.date_str,
-                item.status,
                 pct,
+                eta_val,
+                item.status,
+                item.date_str,
             ),
             tags=(tag,),
         )
@@ -3274,10 +3622,10 @@ class TelegramUploaderApp(
             self.toggle_pause_download()
             return
 
-        if self.is_downloading or self.is_uploading:
+        if self.is_downloading:
             messagebox.showwarning(
-                "Operação em andamento",
-                "Aguarde ou pause a transferência atual antes de iniciar outra.",
+                "Download em andamento",
+                "Já existe um download em andamento. Aguarde ou pause o download atual.",
             )
             return
 
@@ -3390,20 +3738,40 @@ class TelegramUploaderApp(
         item: RemoteCloudFile,
         status_tag: str,
         progress_text: str,
+        eta_text: str = "",
         scroll_to: bool = False,
     ):
         item.status = status_tag
 
         def _ui():
-            if self.dl_tree.exists(item.row_id):
-                chk_str = "☑" if item.checked else "☐"
-                self.dl_tree.set(item.row_id, "check", chk_str)
-                self.dl_tree.set(item.row_id, "filename", item.filename)
-                self.dl_tree.set(item.row_id, "status", status_tag)
-                self.dl_tree.set(item.row_id, "progress", progress_text)
-                self.dl_tree.item(item.row_id, tags=(status_tag,))
-                if scroll_to:
-                    self.dl_tree.see(item.row_id)
+            # Se scroll_to=True e o arquivo estiver em outra página, acompanha automaticamente a página dele!
+            if not self.dl_tree.exists(item.row_id):
+                if scroll_to and self.dl_filtered_files:
+                    try:
+                        pos = self.dl_filtered_files.index(item)
+                        target_page = pos // self.dl_page_size
+                        if target_page != self.dl_page_index:
+                            self.dl_page_index = target_page
+                            self._render_current_dl_page()
+                    except ValueError:
+                        return
+                if not self.dl_tree.exists(item.row_id):
+                    return
+
+            chk_str = "☑" if item.checked else "☐"
+            self.dl_tree.set(item.row_id, "check", chk_str)
+            self.dl_tree.set(item.row_id, "filename", item.filename)
+            self.dl_tree.set(item.row_id, "progress", progress_text)
+            if eta_text:
+                self.dl_tree.set(item.row_id, "eta", eta_text)
+            self.dl_tree.set(item.row_id, "status", status_tag)
+            self.dl_tree.item(item.row_id, tags=(status_tag,))
+            if scroll_to:
+                self.dl_tree.see(item.row_id)
+                try:
+                    self.dl_tree.selection_set(item.row_id)
+                except Exception:
+                    pass
 
         self.after(0, _ui)
 
@@ -3515,22 +3883,80 @@ class TelegramUploaderApp(
         self.ul_page_index = 0
         self._render_current_upload_page()
 
+    def _show_flood_wait_banner(self, remaining_sec: int, mode: str = "upload"):
+        """Exibe a barra amarela de atenção com contagem regressiva clara quando o limite do Telegram é atingido."""
+        op_label = "upload" if mode == "upload" else "download"
+        time_str = format_eta(remaining_sec)
+
+        def _ui():
+            if not hasattr(self, "flood_wait_banner"):
+                return
+            self.flood_wait_title_label.configure(
+                text=(
+                    f"⚠️ Limite de {op_label} do Telegram atingido — será restabelecido em {time_str} "
+                    f"(o programa continuará automaticamente!)"
+                )
+            )
+            self.flood_wait_desc_label.configure(
+                text=(
+                    f"É totalmente normal o Telegram fazer isso: quando muitos arquivos são enviados em sequência, "
+                    f"o servidor aplica uma pausa temporária para proteger contra spam e evitar sobrecarga. "
+                    f"Aguarde {time_str} — assim que o tempo zerar, o {op_label} será retomado sozinho."
+                )
+            )
+            self.flood_wait_banner.grid()
+
+        self.after(0, _ui)
+
+    def _show_scan_progress(self, frac: float, title_text: str, bar_text: str):
+        """Exibe e atualiza a barra de progresso de varredura na parte inferior com % e tempo estimado."""
+        def _ui():
+            if not hasattr(self, "scan_progress_frame"):
+                return
+            self.scan_progress_title_label.configure(text=title_text)
+            self.scan_progress_bar.set(frac, bar_text)
+            self.scan_progress_frame.grid()
+
+        self.after(0, _ui)
+
+    def _hide_scan_progress(self):
+        """Oculta a barra de progresso de varredura ao finalizar."""
+        def _ui():
+            if hasattr(self, "scan_progress_frame"):
+                self.scan_progress_frame.grid_remove()
+
+        self.after(0, _ui)
+
+    def _hide_flood_wait_banner(self):
+        """Oculta a barra amarela de atenção quando o limite do Telegram for restabelecido ou cancelado."""
+        def _ui():
+            if hasattr(self, "flood_wait_banner"):
+                self.flood_wait_banner.grid_remove()
+
+        self.after(0, _ui)
+
+    def _format_inline_progress(self, frac: float) -> str:
+        """Retorna mini barra visual + percentual para exibir diretamente na frente de cada arquivo."""
+        f = max(0.0, min(1.0, float(frac or 0.0)))
+        filled = int(round(f * 8))
+        bar = "█" * filled + "░" * (8 - filled)
+        return f"{bar} {f * 100:0.0f}%"
+
     def _insert_item_row(self, item: FileQueueItem):
         chk_str = "☑" if item.checked else "☐"
         icon = "✓" if item.status in ("Concluído", "Já Enviado") else "📄"
-        pct = (
-            "100%"
-            if item.status in ("Concluído", "Já Enviado")
-            else (
-                "Ignorado"
-                if item.status in ("Ignorado (Repetido)", "Ignorado (> 2GB)")
-                else (
-                    "Falha Perm."
-                    if item.status == "Erro Permanente"
-                    else f"{item.progress * 100:0.0f}%"
-                )
-            )
-        )
+        if item.status in ("Concluído", "Já Enviado"):
+            pct = self._format_inline_progress(1.0)
+            eta_val = "Concluído"
+        elif item.status in ("Ignorado (Repetido)", "Ignorado (> 2GB)"):
+            pct = "Ignorado"
+            eta_val = "-"
+        elif item.status == "Erro Permanente":
+            pct = "Falha Perm."
+            eta_val = "-"
+        else:
+            pct = self._format_inline_progress(item.progress)
+            eta_val = "-"
         tag = (
             "Marcado"
             if item.checked and item.status == "Pendente"
@@ -3543,10 +3969,11 @@ class TelegramUploaderApp(
             values=(
                 chk_str,
                 f"{icon} {item.path.name}",
+                pct,
+                eta_val,
+                item.status,
                 str(item.path.parent),
                 format_size(item.size),
-                item.status,
-                pct,
                 item.sent_at or "-",
             ),
             tags=(tag,),
@@ -3939,7 +4366,8 @@ class TelegramUploaderApp(
             self.after(
                 0,
                 lambda: self._insert_scanned_batches(
-                    found_files, f"{len(folders)} pasta(s)"
+                    found_files,
+                    f"{len(folders)} pasta(s)",
                 ),
             )
 
@@ -3966,7 +4394,8 @@ class TelegramUploaderApp(
                 except OSError:
                     continue
             self.after(
-                0, lambda: self._insert_scanned_batches(found, source_label)
+                0,
+                lambda: self._insert_scanned_batches(found, source_label),
             )
 
         threading.Thread(target=_stat_worker, daemon=True).start()
@@ -3981,7 +4410,8 @@ class TelegramUploaderApp(
         ignored_over_2gb_count: int = 0,
     ):
         BATCH_SIZE = 300
-        end_idx = min(start_idx + BATCH_SIZE, len(files_with_sizes))
+        total_files = len(files_with_sizes)
+        end_idx = min(start_idx + BATCH_SIZE, total_files)
         check_sent = (
             self.skip_sent_var.get() and not self.ignore_duplicates_var.get()
         )
@@ -4037,10 +4467,10 @@ class TelegramUploaderApp(
         self._update_ul_pagination_controls()
         self._update_queue_summary()
 
-        if end_idx < len(files_with_sizes):
-            progress_txt = f"Carregando arquivos na lista... ({end_idx} de {len(files_with_sizes)})"
+        if end_idx < total_files:
+            progress_txt = f"Carregando arquivos na lista... ({end_idx} de {total_files})"
             self.current_file_label.configure(
-                text=f"⏳ Lendo os arquivos, aguarde... ({end_idx}/{len(files_with_sizes)})"
+                text=f"⏳ Lendo os arquivos, aguarde... ({end_idx}/{total_files})"
             )
             self._update_scan_lock_ui(progress_txt)
             self.after(
@@ -4068,7 +4498,7 @@ class TelegramUploaderApp(
             msg = f"Pronto! {added_so_far} arquivo(s) adicionados de {source_label}.{extra_2gb}"
             self.current_file_label.configure(text=msg)
             self.log(msg)
-            self._save_queue_state()
+            self._schedule_save_queue_state(immediate=True)
 
     def remove_selected_items(self):
         checked_iids = [i.item_id for i in self.queue if i.checked]
@@ -4121,7 +4551,6 @@ class TelegramUploaderApp(
         self._update_ul_pagination_controls()
         self._update_queue_summary()
         self._schedule_save_queue_state(immediate=True)
-        self.file_progress_bar.set(0)
         self.total_progress_bar.set(0)
         self.current_file_label.configure(text="Fila de upload limpa.")
 
@@ -4151,7 +4580,7 @@ class TelegramUploaderApp(
             self.toggle_pause_upload()
             return
 
-        if self.is_uploading or self.is_downloading:
+        if self.is_uploading:
             return
 
         pending_items = [
@@ -4428,6 +4857,7 @@ class TelegramUploaderApp(
         item: FileQueueItem,
         status_tag: str,
         progress_text: str,
+        eta_text: str = "",
         scroll_to: bool = False,
     ):
         item.status = status_tag
@@ -4438,20 +4868,36 @@ class TelegramUploaderApp(
                     self.tree.delete(item.item_id)
                 return
 
-            # Só atualiza na Treeview se o item estiver na página atual (nunca insere 70.000 linhas no Tkinter!)
+            # Se scroll_to=True e o item estiver em outra página da fila paginada, acompanha automaticamente a página dele!
             if not self.tree.exists(item.item_id):
-                return
+                if scroll_to and self.ul_filtered_items:
+                    try:
+                        pos = self.ul_filtered_items.index(item)
+                        target_page = pos // self.ul_page_size
+                        if target_page != self.ul_page_index:
+                            self.ul_page_index = target_page
+                            self._render_current_upload_page()
+                    except ValueError:
+                        return
+                if not self.tree.exists(item.item_id):
+                    return
 
             chk_str = "☑" if item.checked else "☐"
             icon = "✓" if status_tag in ("Concluído", "Já Enviado") else "📄"
             self.tree.set(item.item_id, "check", chk_str)
             self.tree.set(item.item_id, "name", f"{icon} {item.path.name}")
-            self.tree.set(item.item_id, "status", status_tag)
             self.tree.set(item.item_id, "progress", progress_text)
+            if eta_text:
+                self.tree.set(item.item_id, "eta", eta_text)
+            self.tree.set(item.item_id, "status", status_tag)
             self.tree.set(item.item_id, "sent_at", item.sent_at or "-")
             self.tree.item(item.item_id, tags=(status_tag,))
             if scroll_to:
                 self.tree.see(item.item_id)
+                try:
+                    self.tree.selection_set(item.item_id)
+                except Exception:
+                    pass
 
         self.after(0, _ui)
 
