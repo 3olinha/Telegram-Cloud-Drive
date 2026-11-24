@@ -27,21 +27,24 @@ O **Telegram Cloud Drive** é um aplicativo desktop nativo para Windows (10/11, 
 
 ### 1.3. Estrutura de Pastas e Arquivos
 ```text
-C:\Users\tiago\.gemini\antigravity\scratch\Telegram_Cloud_Drive_Source\
-├── main.py                          # Monolito principal da aplicação (~6.460 linhas): GUI, AsyncWorker, Upload/Download Turbo, Auto-Updater e Desinstalador (--uninstall)
-├── installer_setup.py               # Código-fonte do Instalador do Windows (extrai payload_app.exe, cria atalhos .lnk e registra no Painel de Controle via winreg)
-├── publicar_atualizacao_github.py   # Script de CI/CD local que sincroniza o código-fonte (.py) e publica Releases/Assets na API do GitHub
+<PASTA_DO_PROJETO>/
+├── main.py                          # Ponto de entrada e orquestrador leve
+├── storage/                         # Persistência local, fingerprint, integridade SHA-256 e cache SQLite (FTS5)
+├── telegram_core/                   # Cliente Telethon (MTProto), login QR/Telefone/2FA, motor Turbo paralelo e classificador de erros
+├── updater/                         # Autoatualização via GitHub Releases, toast de 30s, pulso de alerta e desinstalador (--uninstall)
+├── ui/                              # Interface CustomTkinter, paginação virtual, ícones por tipo e barra amarela de FloodWait
+├── installer_setup.py               # Código-fonte do Instalador do Windows (extrai payload_app.exe, cria atalhos .lnk e registra no Painel de Controle)
+├── publicar_atualizacao_github.py   # Script de CI/CD local que sincroniza o código-fonte modular e publica Releases/Assets no GitHub
 ├── pyproject.toml / uv.lock         # Manifesto de dependências Python (customtkinter, pillow, qrcode, telethon, cryptg, pyinstaller)
 ├── telegram_icon.ico / .png         # Ícone oficial principal do aplicativo
-├── bolinha.ico / .png               # Ícone secundário/legado
 └── dist/                            # Saída dos binários compilados pelo PyInstaller
 
-C:\Users\tiago\OneDrive - Sistema FIEG\Área de Trabalho\
-├── Instalador\
-│   └── Instalador_Telegram_Cloud_Drive_v0.14.exe   # Instalador standalone para Windows
-└── Portatil\
-    ├── Telegram_Cloud_Drive_v0.14.exe              # Executável portátil (roda direto do pendrive)
-    └── COMO_USAR_VERSAO_PORTATIL.txt               # Manual do usuário da versão portátil
+<AREA_DE_TRABALHO>/
+├── Instalador/
+│   └── Instalador_Telegram_Cloud_Drive_v<VERSAO>.exe   # Instalador standalone para Windows
+└── Portatil/
+    ├── Telegram_Cloud_Drive_v<VERSAO>.exe              # Executável portátil (roda direto do pendrive)
+    └── COMO_USAR_VERSAO_PORTATIL.txt                   # Manual do usuário da versão portátil
 ```
 
 ### 1.4. Fluxo Geral de Execução e Modelo de Concorrência (Dual-Thread)
@@ -174,7 +177,7 @@ Um requisito crítico da versão portátil (pendrive) é garantir que, se o usu�
 - Os arquivos de sessão e configuração nunca são salvos na pasta do pendrive (`EXE_DIR`), mas sim em `%LOCALAPPDATA%\BolinhaTelegramUploader\pc_<hash>`. Assim, ao abrir em qualquer outro computador, a pasta local estará vazia e o programa solicitará um novo login.
 
 ### 4.2. Proteção de Credenciais de Publicação (`GITHUB_TOKEN`)
-- O Personal Access Token do GitHub (`GITHUB_TOKEN`) usado para publicar novas versões fica armazenado **exclusivamente** no arquivo local `C:\Users\tiago\.env` da máquina do desenvolvedor.
+- O Personal Access Token do GitHub (`GITHUB_TOKEN`) usado para publicar novas versões fica armazenado **exclusivamente** em variável de ambiente ou no arquivo local `~/.env` da máquina do desenvolvedor.
 - Ele é lido apenas pelo script de build/deploy `publicar_atualizacao_github.py` e **nunca é incluído ou empacotado** dentro de `main.py`, `installer_setup.py` ou dos executáveis `.exe` distribuídos.
 - Os clientes finais consultam apenas o endpoint público de leitura `https://api.github.com/repos/3olinha/Telegram-Cloud-Drive/releases/latest` (sem necessidade de autenticação).
 
@@ -229,9 +232,8 @@ Para outra IA ou desenvolvedor que for evoluir este projeto, estes são os ponto
 2. **Credenciais `DEFAULT_API_ID` e `DEFAULT_API_HASH` Compartilhadas:**
    - **Situação atual:** O código traz por padrão `DEFAULT_API_ID = 2040` e `DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"` para que o usuário final possa logar com QR Code ou telefone sem precisar criar uma conta de desenvolvedor em `my.telegram.org`.
    - **Recomendação:** Se o aplicativo for distribuído em larga escala para muitos usuários externos, é recomendável registrar um `api_id` / `api_hash` próprio em `my.telegram.org` ou orientar usuários avançados a configurarem o próprio par na guia `⚙ Opções > Informações da Conta`.
-3. **Caminhos Locais no Script de Deploy (`publicar_atualizacao_github.py`):**
-   - **Situação atual:** `publicar_atualizacao_github.py` referencia `DESKTOP_DIR = Path(r"C:\Users\tiago\OneDrive - Sistema FIEG\Área de Trabalho")` para localizar as pastas `Portatil` e `Instalador` e o repositório `GITHUB_REPO = "3olinha/Telegram-Cloud-Drive"`.
-   - **Recomendação:** Ao portar o ambiente de build para outra máquina ou para GitHub Actions, parametrizar `DESKTOP_DIR` via variável de ambiente ou usar exclusivamente `./dist`.
+3. **Portabilidade do Script de Deploy (`publicar_atualizacao_github.py`):**
+   - **Situação atual:** `publicar_atualizacao_github.py` resolve o diretório de distribuição dinamicamente via `TCD_DIST_DIR`, `get_windows_desktop_dir()` (`Path.home()`) e fallback para `./dist`, sem caminhos locais hardcoded.
 4. **Assinatura Digital (Code Signing) Autoassinada vs. Certificado EV/OV:**
    - **Situação atual:** O build local assina os binários `.exe` com um certificado local (`Cert:\CurrentUser\My -CodeSigningCert`), o que evita avisos na máquina de desenvolvimento, mas em máquinas de terceiros o Windows SmartScreen ainda pode exibir alerta na primeira execução de um binário PyInstaller `--onefile` não assinado por uma Autoridade Certificadora comercial (DigiCert, Sectigo, SignPath).
 5. **Escalabilidade do `ttk.Treeview` Acima de 100.000 Linhas:**
