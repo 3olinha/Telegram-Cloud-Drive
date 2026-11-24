@@ -9,6 +9,7 @@ Motor Telethon (MTProto):
 """
 
 import asyncio
+from collections import deque
 import hashlib
 import json
 import threading
@@ -598,8 +599,8 @@ class TelegramTransferEngineMixin:
         fully_scanned: bool,
     ) -> bool:
         """
-        Varredura rápida em 2º plano com filtro de servidor (InputMessagesFilterDocument)
-        e leitura incremental apoiada pelo banco local SQLite.
+        Varredura rápida em 2º plano com filtro de servidor (InputMessagesFilterDocument),
+        leitura incremental apoiada pelo banco local SQLite e barra de progresso com % e ETA no rodapé.
         """
         if not self.client.is_connected():
             await self.client.connect()
@@ -608,81 +609,134 @@ class TelegramTransferEngineMixin:
             self.config_data.get("download_dir", str(DEFAULT_DOWNLOAD_DIR))
         )
 
-        # Fase 1: Se já tínhamos cache, busca apenas arquivos NOVOS enviados após max_cached_id
-        if max_cached_id > 0:
-            new_batch: List[RemoteCloudFile] = []
-            async for msg in self.client.iter_messages(
-                target_entity,
-                min_id=max_cached_id,
-                limit=None,
-                filter=InputMessagesFilterDocument,
-            ):
-                if token != self._remote_scan_token:
-                    return False
-                rf = self._extract_remote_file_from_msg(msg, dl_dir)
-                if rf:
-                    new_batch.append(rf)
-                    if len(new_batch) >= 150:
-                        b_copy = list(new_batch)
-                        new_batch.clear()
-                        self.after(
-                            0,
-                            lambda b=b_copy: self._stream_remote_batch_to_ui(
-                                b, True, token, entity_key, False
-                            ),
-                        )
-            if new_batch and token == self._remote_scan_token:
-                b_copy = list(new_batch)
-                self.after(
-                    0,
-                    lambda b=b_copy: self._stream_remote_batch_to_ui(
-                        b, True, token, entity_key, True
-                    ),
+        # Consulta instantânea do total real de documentos no grupo no Telegram (para % e ETA exatos)
+        total_remote = 0
+        try:
+            probe = await self.client.get_messages(
+                target_entity, limit=0, filter=InputMessagesFilterDocument
+            )
+            total_remote = int(getattr(probe, "total", 0) or 0)
+        except Exception:
+            total_remote = 0
+
+        base_cached = len(self.remote_files)
+        scanned_now = 0
+        scan_start_t = time.monotonic()
+
+        def _push_scan_ui(force: bool = False):
+            if token != self._remote_scan_token:
+                return
+            if not force and scanned_now % 100 != 0:
+                return
+            cur_total = base_cached + scanned_now
+            denom = max(total_remote, cur_total, 1)
+            frac = min(cur_total / denom, 0.995) if denom > 0 else 0.0
+            elapsed = max(time.monotonic() - scan_start_t, 0.1)
+            rate = scanned_now / elapsed if scanned_now > 0 else 0.0
+            rem_items = max(0, total_remote - cur_total)
+            eta_str = (
+                format_eta(rem_items / rate)
+                if (rate > 0 and rem_items > 0)
+                else ("quase pronto..." if scanned_now > 0 else "calculando...")
+            )
+            if total_remote > 0:
+                title = (
+                    f"🔍 Varredura do Grupo no Telegram: {cur_total}/{total_remote} "
+                    f"({frac * 100:0.1f}%)   •   Tempo estimado: {eta_str}"
                 )
+                bar_txt = f"{frac * 100:0.1f}%   •   Tempo estimado: {eta_str}"
+            else:
+                title = f"🔍 Varredura do Grupo no Telegram: {cur_total} arquivo(s) lidos..."
+                bar_txt = f"{cur_total} arquivo(s) lidos..."
+            self._show_scan_progress(frac, title, bar_txt)
 
-        # Fase 2: Se o histórico completo do grupo ainda não foi 100% varrido, continua de onde parou
-        if not fully_scanned and token == self._remote_scan_token:
-            older_batch: List[RemoteCloudFile] = []
-            added_since_save = 0
-            iter_kwargs = {
-                "limit": None,
-                "filter": InputMessagesFilterDocument,
-            }
-            if min_cached_id > 1:
-                iter_kwargs["max_id"] = min_cached_id - 1
+        try:
+            # Só exibe a barra inicialmente se ainda faltar histórico ou se houver arquivos a descobrir
+            if not fully_scanned or total_remote > base_cached:
+                _push_scan_ui(force=True)
 
-            async for msg in self.client.iter_messages(
-                target_entity, **iter_kwargs
-            ):
-                if token != self._remote_scan_token:
-                    return False
-                rf = self._extract_remote_file_from_msg(msg, dl_dir)
-                if rf:
-                    older_batch.append(rf)
-                    added_since_save += 1
-                    if len(older_batch) >= 250:
-                        b_copy = list(older_batch)
-                        older_batch.clear()
-                        should_save = added_since_save >= 1000
-                        if should_save:
-                            added_since_save = 0
-                        self.after(
-                            0,
-                            lambda b=b_copy, sv=should_save: self._stream_remote_batch_to_ui(
-                                b, False, token, entity_key, sv
-                            ),
-                        )
+            # Fase 1: Se já tínhamos cache, busca apenas arquivos NOVOS enviados após max_cached_id
+            if max_cached_id > 0:
+                new_batch: List[RemoteCloudFile] = []
+                async for msg in self.client.iter_messages(
+                    target_entity,
+                    min_id=max_cached_id,
+                    limit=None,
+                    filter=InputMessagesFilterDocument,
+                ):
+                    if token != self._remote_scan_token:
+                        return False
+                    rf = self._extract_remote_file_from_msg(msg, dl_dir)
+                    if rf:
+                        new_batch.append(rf)
+                        scanned_now += 1
+                        _push_scan_ui()
+                        if len(new_batch) >= 150:
+                            b_copy = list(new_batch)
+                            new_batch.clear()
+                            self.after(
+                                0,
+                                lambda b=b_copy: self._stream_remote_batch_to_ui(
+                                    b, True, token, entity_key, False
+                                ),
+                            )
+                if new_batch and token == self._remote_scan_token:
+                    b_copy = list(new_batch)
+                    self.after(
+                        0,
+                        lambda b=b_copy: self._stream_remote_batch_to_ui(
+                            b, True, token, entity_key, True
+                        ),
+                    )
 
-            if older_batch and token == self._remote_scan_token:
-                b_copy = list(older_batch)
-                self.after(
-                    0,
-                    lambda b=b_copy: self._stream_remote_batch_to_ui(
-                        b, False, token, entity_key, False
-                    ),
-                )
+            # Fase 2: Se o histórico completo do grupo ainda não foi 100% varrido, continua de onde parou
+            if not fully_scanned and token == self._remote_scan_token:
+                older_batch: List[RemoteCloudFile] = []
+                added_since_save = 0
+                iter_kwargs = {
+                    "limit": None,
+                    "filter": InputMessagesFilterDocument,
+                }
+                if min_cached_id > 1:
+                    iter_kwargs["max_id"] = min_cached_id - 1
 
-        return token == self._remote_scan_token
+                async for msg in self.client.iter_messages(
+                    target_entity, **iter_kwargs
+                ):
+                    if token != self._remote_scan_token:
+                        return False
+                    rf = self._extract_remote_file_from_msg(msg, dl_dir)
+                    if rf:
+                        older_batch.append(rf)
+                        scanned_now += 1
+                        added_since_save += 1
+                        _push_scan_ui()
+                        if len(older_batch) >= 250:
+                            b_copy = list(older_batch)
+                            older_batch.clear()
+                            should_save = added_since_save >= 1000
+                            if should_save:
+                                added_since_save = 0
+                            self.after(
+                                0,
+                                lambda b=b_copy, sv=should_save: self._stream_remote_batch_to_ui(
+                                    b, False, token, entity_key, sv
+                                ),
+                            )
+
+                if older_batch and token == self._remote_scan_token:
+                    b_copy = list(older_batch)
+                    self.after(
+                        0,
+                        lambda b=b_copy: self._stream_remote_batch_to_ui(
+                            b, False, token, entity_key, False
+                        ),
+                    )
+
+            return token == self._remote_scan_token
+        finally:
+            if token == self._remote_scan_token:
+                self._hide_scan_progress()
 
     async def _async_delete_messages_from_group(
         self,
@@ -710,26 +764,27 @@ class TelegramTransferEngineMixin:
     # Processador Assíncrono de Downloads (Com Verificação SHA-256 + Erros Inteligentes)
     # -------------------------------------------------------------------------
     async def _async_sleep_interruptible_dl(
-        self, seconds: int, status_prefix: str
+        self, seconds: int, status_prefix: str, is_flood_wait: bool = False
     ) -> bool:
-        for remaining in range(seconds, 0, -1):
-            if self.cancel_download_requested or self.is_download_paused:
-                return False
-            if remaining % 60 == 0 or remaining <= 30 or seconds <= 15:
-                if remaining >= 60:
-                    mins = remaining // 60
-                    secs = remaining % 60
-                    time_str = f"{mins}m {secs:02d}s"
-                else:
-                    time_str = f"{remaining}s"
-                self.after(
-                    0,
-                    lambda msg=f"{status_prefix} (aguardando {time_str}...)": self.current_file_label.configure(
-                        text=msg
-                    ),
-                )
-            await asyncio.sleep(1)
-        return not (self.cancel_download_requested or self.is_download_paused)
+        try:
+            for remaining in range(seconds, 0, -1):
+                if self.cancel_download_requested or self.is_download_paused:
+                    return False
+                if is_flood_wait:
+                    self._show_flood_wait_banner(remaining, mode="download")
+                if remaining % 60 == 0 or remaining <= 30 or seconds <= 15 or is_flood_wait:
+                    time_str = format_eta(remaining)
+                    self.after(
+                        0,
+                        lambda msg=f"{status_prefix} (restam {time_str}...)": self.current_file_label.configure(
+                            text=msg
+                        ),
+                    )
+                await asyncio.sleep(1)
+            return not (self.cancel_download_requested or self.is_download_paused)
+        finally:
+            if is_flood_wait:
+                self._hide_flood_wait_banner()
 
     async def _async_process_downloads(
         self, items: List[RemoteCloudFile], dl_dir: Path
@@ -786,8 +841,9 @@ class TelegramTransferEngineMixin:
                     )
                     self.after(
                         0,
-                        lambda name=item.filename, i=idx, t=len(current_batch), sfx=att_suffix: self.current_file_label.configure(
-                            text=f"Baixando ({i}/{t}): {name}{sfx}"
+                        lambda name=item.filename, i=idx, t=len(current_batch), sfx=att_suffix: self._update_footer_transfer_status(
+                            "download",
+                            current_text=f"Baixando ({i}/{t}): {name}{sfx}",
                         ),
                     )
 
@@ -839,29 +895,22 @@ class TelegramTransferEngineMixin:
                             else "calculando..."
                         )
 
+                        bar_str = self._format_inline_progress(frac)
+
                         def _ui():
                             if self.dl_tree.exists(current_item.row_id):
                                 self.dl_tree.set(
-                                    current_item.row_id, "progress", pct_str
+                                    current_item.row_id, "progress", bar_str
                                 )
-                            self.file_progress_bar.set(
-                                frac,
-                                f"{frac * 100:0.1f}%   •   Tempo previsto: {file_eta_str}",
-                            )
-                            self.total_progress_bar.set(
-                                overall_frac,
-                                f"{overall_frac * 100:0.1f}%   •   Tempo previsto: {total_eta_str}",
-                            )
-                            if hasattr(self, "file_progress_title_label"):
-                                self.file_progress_title_label.configure(
-                                    text=f"Progresso do Arquivo Atual:   •   Tempo previsto para conclusão: {file_eta_str}"
+                                self.dl_tree.set(
+                                    current_item.row_id, "eta", file_eta_str
                                 )
-                            if hasattr(self, "total_progress_title_label"):
-                                self.total_progress_title_label.configure(
-                                    text=f"Progresso Total da Operação:   •   Tempo previsto para conclusão: {total_eta_str}"
-                                )
-                            self.speed_label.configure(
-                                text=f"Velocidade: {speed_mb:0.2f} MB/s | Progresso Geral: {completed_count}/{total_count} ({overall_frac * 100:0.0f}%)"
+                            self._update_footer_transfer_status(
+                                "download",
+                                overall_frac=overall_frac,
+                                bar_text=f"{overall_frac * 100:0.1f}%   •   Tempo previsto: {total_eta_str}",
+                                title_text=f"Progresso Total do Download:   •   Tempo previsto para conclusão: {total_eta_str}",
+                                speed_text=f"Velocidade (Download): {speed_mb:0.2f} MB/s | Progresso Geral: {completed_count}/{total_count} ({overall_frac * 100:0.0f}%)",
                             )
 
                         self.after(0, _ui)
@@ -914,7 +963,13 @@ class TelegramTransferEngineMixin:
                         completed_count += 1
                         completed_batch_bytes += max(item.size, 0)
                         item.progress = 1.0
-                        self._update_dl_item_ui(item, "Baixado ✓", "100%")
+                        self._update_dl_item_ui(
+                            item,
+                            "Baixado ✓",
+                            self._format_inline_progress(1.0),
+                            eta_text="Concluído",
+                            scroll_to=True,
+                        )
                         integrity_badge = (
                             f" [{integrity_msg}]"
                             if item.size >= LARGE_FILE_THRESHOLD or expected_sha
@@ -927,22 +982,29 @@ class TelegramTransferEngineMixin:
 
                     except TransferPausedError:
                         self._update_dl_item_ui(
-                            item, "Pausado", f"{item.progress * 100:0.0f}%"
+                            item,
+                            "Pausado",
+                            self._format_inline_progress(item.progress),
+                            eta_text="Pausado",
                         )
                         break
                     except asyncio.CancelledError:
                         self._update_dl_item_ui(
-                            item, "Disponível na Nuvem", f"{item.progress * 100:0.0f}%"
+                            item,
+                            "Disponível na Nuvem",
+                            self._format_inline_progress(item.progress),
+                            eta_text="-",
                         )
                         self.log(f"■ Download interrompido: {item.filename}")
                         break
                     except errors.FloodWaitError as fw:
                         self.log(
-                            f"Limite do Telegram atingido em '{item.filename}'. Aguardando {fw.seconds}s..."
+                            f"Limite de velocidade do Telegram atingido em '{item.filename}'. Aguardando {fw.seconds}s..."
                         )
                         ok = await self._async_sleep_interruptible_dl(
                             fw.seconds,
-                            f"Aguardando limite do Telegram ({item.filename})",
+                            f"⚠️ Limite do Telegram em '{item.filename}'",
+                            is_flood_wait=True,
                         )
                         if not ok:
                             break
@@ -1011,27 +1073,68 @@ class TelegramTransferEngineMixin:
     # -------------------------------------------------------------------------
     # Processador Assíncrono de Uploads (Motor Turbo Paralelo + SHA-256 + Erros Inteligentes)
     # -------------------------------------------------------------------------
+    async def _smart_flood_wait_guard(self, target_entity: Union[int, str]):
+        """
+        Limitador adaptativo anti-FloodWaitError (Sliding Window Rate-Limiter):
+        - Mantém a taxa de mensagens no mesmo grupo/canal abaixo de 18 msgs/minuto (o limite do Telegram é ~20/min).
+        - Arquivos médios/grandes (que já levam >= 3s para subir) têm atraso ZERO (0.0s), mantendo 100% da velocidade!
+        - Apenas rajadas muito rápidas de arquivos minúsculos recebem micropausas suaves e interruptíveis.
+        """
+        if target_entity == "me":
+            return
+        if not hasattr(self, "_recent_msg_send_ts"):
+            self._recent_msg_send_ts = deque()
+
+        now = time.monotonic()
+        # Remove timestamps com mais de 60 segundos
+        while self._recent_msg_send_ts and (now - self._recent_msg_send_ts[0]) >= 60.5:
+            self._recent_msg_send_ts.popleft()
+
+        wait_needed = 0.0
+        # 1. Janela de 60s: máximo 18 mensagens/minuto no mesmo grupo (evita bloqueios de 30-40 min!)
+        if len(self._recent_msg_send_ts) >= 18:
+            wait_needed = max(wait_needed, 60.5 - (now - self._recent_msg_send_ts[0]))
+        # 2. Suavização de rajada curta (burst de arquivos de 1 KB): máx 5 msgs em 10s
+        recent_10s = [t for t in self._recent_msg_send_ts if (now - t) < 10.0]
+        if len(recent_10s) >= 5:
+            wait_needed = max(wait_needed, 1.8)
+
+        if wait_needed > 0.05:
+            end_t = time.monotonic() + wait_needed
+            while time.monotonic() < end_t:
+                if self.cancel_requested or self.is_paused:
+                    return
+                await asyncio.sleep(min(0.15, max(0.02, end_t - time.monotonic())))
+
+    def _record_msg_send_timestamp(self, target_entity: Union[int, str]):
+        if target_entity == "me":
+            return
+        if not hasattr(self, "_recent_msg_send_ts"):
+            self._recent_msg_send_ts = deque()
+        self._recent_msg_send_ts.append(time.monotonic())
+
     async def _async_sleep_interruptible_ul(
-        self, seconds: int, status_prefix: str
+        self, seconds: int, status_prefix: str, is_flood_wait: bool = False
     ) -> bool:
-        for remaining in range(seconds, 0, -1):
-            if self.cancel_requested or self.is_paused:
-                return False
-            if remaining % 60 == 0 or remaining <= 30 or seconds <= 15:
-                if remaining >= 60:
-                    mins = remaining // 60
-                    secs = remaining % 60
-                    time_str = f"{mins}m {secs:02d}s"
-                else:
-                    time_str = f"{remaining}s"
-                self.after(
-                    0,
-                    lambda msg=f"{status_prefix} (aguardando {time_str}...)": self.current_file_label.configure(
-                        text=msg
-                    ),
-                )
-            await asyncio.sleep(1)
-        return not (self.cancel_requested or self.is_paused)
+        try:
+            for remaining in range(seconds, 0, -1):
+                if self.cancel_requested or self.is_paused:
+                    return False
+                if is_flood_wait:
+                    self._show_flood_wait_banner(remaining, mode="upload")
+                if remaining % 60 == 0 or remaining <= 30 or seconds <= 15 or is_flood_wait:
+                    time_str = format_eta(remaining)
+                    self.after(
+                        0,
+                        lambda msg=f"{status_prefix} (restam {time_str}...)": self.current_file_label.configure(
+                            text=msg
+                        ),
+                    )
+                await asyncio.sleep(1)
+            return not (self.cancel_requested or self.is_paused)
+        finally:
+            if is_flood_wait:
+                self._hide_flood_wait_banner()
 
     async def _async_process_queue(
         self,
@@ -1093,7 +1196,9 @@ class TelegramTransferEngineMixin:
                     break
 
                 if item.size > MAX_TELEGRAM_FILE_SIZE:
-                    self._update_item_ui(item, "Ignorado (> 2GB)", "Ignorado")
+                    self._update_item_ui(
+                        item, "Ignorado (> 2GB)", "Ignorado", eta_text="-", scroll_to=True
+                    )
                     self.log(
                         f"⏭ Ignorado (> 2 GB): '{item.path.name}' ({format_size(item.size)}) excede o limite de 2 GB do Telegram."
                     )
@@ -1113,7 +1218,11 @@ class TelegramTransferEngineMixin:
                     if existing_info:
                         if ignore_all_duplicates:
                             self._update_item_ui(
-                                item, "Ignorado (Repetido)", "Ignorado"
+                                item,
+                                "Ignorado (Repetido)",
+                                "Ignorado",
+                                eta_text="-",
+                                scroll_to=True,
                             )
                             batch_total_bytes = max(
                                 1, batch_total_bytes - max(item.size, 0)
@@ -1151,7 +1260,11 @@ class TelegramTransferEngineMixin:
                             continue
                         elif dup_choice != "yes":
                             self._update_item_ui(
-                                item, "Ignorado (Repetido)", "Ignorado"
+                                item,
+                                "Ignorado (Repetido)",
+                                "Ignorado",
+                                eta_text="-",
+                                scroll_to=True,
                             )
                             batch_total_bytes = max(
                                 1, batch_total_bytes - max(item.size, 0)
@@ -1216,8 +1329,9 @@ class TelegramTransferEngineMixin:
                     )
                     self.after(
                         0,
-                        lambda name=item.path.name, i=completed_count + 1, t=total_count, sfx=att_suffix: self.current_file_label.configure(
-                            text=f"Enviando ({i}/{t}): {name}{sfx}"
+                        lambda name=item.path.name, i=completed_count + 1, t=total_count, sfx=att_suffix: self._update_footer_transfer_status(
+                            "upload",
+                            current_text=f"Enviando ({i}/{t}): {name}{sfx}",
                         ),
                     )
 
@@ -1284,49 +1398,59 @@ class TelegramTransferEngineMixin:
                             else "calculando..."
                         )
 
+                        bar_str = self._format_inline_progress(frac)
+
                         def _ui():
                             if self.tree.exists(current_item.item_id):
                                 self.tree.set(
-                                    current_item.item_id, "progress", pct_str
+                                    current_item.item_id, "progress", bar_str
                                 )
-                            self.file_progress_bar.set(
-                                frac,
-                                f"{frac * 100:0.1f}%   •   Tempo previsto: {file_eta_str}",
-                            )
-                            self.total_progress_bar.set(
-                                overall_frac,
-                                f"{overall_frac * 100:0.1f}%   •   Tempo previsto: {total_eta_str}",
-                            )
-                            if hasattr(self, "file_progress_title_label"):
-                                self.file_progress_title_label.configure(
-                                    text=f"Progresso do Arquivo Atual:   •   Tempo previsto para conclusão: {file_eta_str}"
+                                self.tree.set(
+                                    current_item.item_id, "eta", file_eta_str
                                 )
-                            if hasattr(self, "total_progress_title_label"):
-                                self.total_progress_title_label.configure(
-                                    text=f"Progresso Total da Operação:   •   Tempo previsto para conclusão: {total_eta_str}"
-                                )
-                            self.speed_label.configure(
-                                text=f"Velocidade: {speed_mb:0.2f} MB/s | Progresso Geral: {completed_count}/{total_count} ({overall_frac * 100:0.0f}%)"
+                            self._update_footer_transfer_status(
+                                "upload",
+                                overall_frac=overall_frac,
+                                bar_text=f"{overall_frac * 100:0.1f}%   •   Tempo previsto: {total_eta_str}",
+                                title_text=f"Progresso Total do Upload:   •   Tempo previsto para conclusão: {total_eta_str}",
+                                speed_text=f"Velocidade (Upload): {speed_mb:0.2f} MB/s | Progresso Geral: {completed_count}/{total_count} ({overall_frac * 100:0.0f}%)",
                             )
 
                         self.after(0, _ui)
 
                     try:
+                        await self._smart_flood_wait_guard(target_entity)
+                        if self.cancel_requested:
+                            raise asyncio.CancelledError("Envio cancelado pelo usuário.")
+                        if self.is_paused:
+                            raise TransferPausedError("Envio pausado pelo usuário.")
+
+                        sent_msg = None
                         if self.connected_mode == "personal":
-                            await self._upload_via_telethon(
+                            sent_msg = await self._upload_via_telethon(
                                 item, target_entity, caption, progress_cb
                             )
                         else:
                             await asyncio.to_thread(
                                 self._upload_via_bot_http, item, caption, progress_cb
                             )
+                        self._record_msg_send_timestamp(target_entity)
 
                         completed_count += 1
                         completed_batch_bytes += max(item.size, 0)
                         session_bytes_transferred += max(item.size, 0)
                         item.progress = 1.0
                         self._record_sent_file(item, target_label)
-                        self._update_item_ui(item, "Concluído", "100%")
+                        self._on_uploaded_file_sync_download_tab(
+                            item, sent_msg, target_label
+                        )
+                        self._update_item_ui(
+                            item,
+                            "Concluído",
+                            self._format_inline_progress(1.0),
+                            eta_text="Concluído",
+                            scroll_to=True,
+                        )
                         sha_info = (
                             f" [SHA-256: {item.sha256[:12]}...]"
                             if item.sha256 and item.size >= LARGE_FILE_THRESHOLD
@@ -1351,13 +1475,19 @@ class TelegramTransferEngineMixin:
                         break
                     except TransferPausedError:
                         self._update_item_ui(
-                            item, "Pausado", f"{item.progress * 100:0.0f}%"
+                            item,
+                            "Pausado",
+                            self._format_inline_progress(item.progress),
+                            eta_text="Pausado",
                         )
                         self._schedule_save_queue_state(immediate=True)
                         break
                     except asyncio.CancelledError:
                         self._update_item_ui(
-                            item, "Cancelado", f"{item.progress * 100:0.0f}%"
+                            item,
+                            "Cancelado",
+                            self._format_inline_progress(item.progress),
+                            eta_text="-",
                         )
                         self.log(f"■ Envio interrompido: {item.path.name}")
                         self._schedule_save_queue_state(immediate=True)
@@ -1365,11 +1495,12 @@ class TelegramTransferEngineMixin:
                     except errors.FloodWaitError as fw:
                         wait_sec = fw.seconds
                         self.log(
-                            f"Limite de velocidade do Telegram atingido em '{item.path.name}'. Aguardando {wait_sec}s..."
+                            f"⚠️ Limite de velocidade do Telegram atingido em '{item.path.name}'. Aguardando {format_eta(wait_sec)} ({wait_sec}s) — retomada automática ao zerar."
                         )
                         ok = await self._async_sleep_interruptible_ul(
                             wait_sec,
-                            f"Aguardando limite do Telegram ({item.path.name})",
+                            f"⚠️ Limite do Telegram em '{item.path.name}'",
+                            is_flood_wait=True,
                         )
                         if not ok:
                             break
@@ -1660,7 +1791,7 @@ class TelegramTransferEngineMixin:
                 file_str,
                 force_document=force_doc,
             )
-            await self.client.send_file(
+            return await self.client.send_file(
                 entity=target_entity,
                 file=uploaded_handle,
                 caption=caption or None,
@@ -1669,7 +1800,7 @@ class TelegramTransferEngineMixin:
                 mime_type=mime_type,
             )
         else:
-            await self.client.send_file(
+            return await self.client.send_file(
                 entity=target_entity,
                 file=file_str,
                 caption=caption or None,
