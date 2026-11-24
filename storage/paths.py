@@ -9,12 +9,14 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_NAME = "Telegram Cloud Drive"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_SUBTITLE = "Gerenciador de Upload e Download de arquivos para Telegram"
 GITHUB_REPO = "3olinha/Telegram-Cloud-Drive"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+DONATE_URL_PIX = "https://livepix.gg/3olinha"
+DONATE_URL_GLOBAL = "https://github.com/sponsors/3olinha"
 UNINSTALL_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\TelegramCloudDrive"
 
 # Limite máximo por arquivo no Telegram (2 GB = 4000 partes de 512 KB = 2.000 MiB)
